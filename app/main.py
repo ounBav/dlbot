@@ -31,8 +31,14 @@ async def lifespan(_: FastAPI):
             break
         except Exception as e:
             if attempt == max_retries - 1:
+                # In production, if DB still unavailable, log but don't crash
+                # Health check will fail until database is ready
                 log.error(f"Failed to run migrations after {max_retries} attempts: {e}")
-                raise
+                log.error("DATABASE NOT READY - Render database may still be initializing")
+                log.error("Check: Render Dashboard → bot-db → Status should be 'Available'")
+                # Don't raise - let the service start (health check will catch it)
+                log.warning("Continuing startup without migrations - database will be initialized on next restart")
+                break
             wait_time = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
             log.warning(f"Migration failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}")
             await asyncio.sleep(wait_time)
