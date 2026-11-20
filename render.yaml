@@ -5,6 +5,7 @@ services:
     runtime: docker
     plan: starter
     healthCheckPath: /health
+    autoDeploy: true
     envVars:
       - key: BOT_TOKEN
         sync: false
