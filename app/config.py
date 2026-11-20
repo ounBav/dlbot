@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     )
 
     bot_token: str
-    webhook_secret: str
+    webhook_secret: str = "dev-webhook-secret-change-in-production"
     public_base_url: str = ""
     db_host: str
     db_port: int = 5432
@@ -63,5 +63,13 @@ def get_settings() -> Settings:
                 f"Invalid DB_HOST: {settings.db_host}. "
                 "In production, Render must auto-link the database host."
             )
+
+    # Warn if using default webhook secret (not production safe)
+    if settings.webhook_secret == "dev-webhook-secret-change-in-production":
+        if _env_file:
+            log.info("Development mode: using default webhook secret")
+        else:
+            log.warning("WEBHOOK_SECRET not set - using default (not secure for production)")
+            log.warning("Set WEBHOOK_SECRET in Render Environment variables")
 
     return settings
