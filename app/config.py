@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -5,7 +6,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # Load .env only in development (not present in Docker image)
+    env_file = ".env" if os.path.exists(".env") else None
+    model_config = SettingsConfigDict(
+        env_file=env_file,
+        extra="ignore",
+        case_sensitive=False,
+        # Environment variables always override .env file
+        env_ignore_empty=False,
+    )
 
     bot_token: str
     webhook_secret: str
