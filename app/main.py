@@ -1,5 +1,6 @@
 """Webhook API. Runs on Render as a web service. Must answer Telegram fast (NFR-01)."""
 
+import asyncio
 import hmac
 import logging
 from contextlib import asynccontextmanager
@@ -21,7 +22,21 @@ tg_client: TelegramClient | None = None
 async def lifespan(_: FastAPI):
     global tg_client
     setup_logging()
-    db.run_migrations()
+
+    # Retry migrations with exponential backoff (handles Render db initialization delay)
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            db.run_migrations()
+            break
+        except Exception as e:
+            if attempt == max_retries - 1:
+                log.error(f"Failed to run migrations after {max_retries} attempts: {e}")
+                raise
+            wait_time = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
+            log.warning(f"Migration failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}")
+            await asyncio.sleep(wait_time)
+
     tg_client = TelegramClient(get_settings().bot_token)
     yield
     tg_client.http.close()

@@ -29,6 +29,7 @@ def pool() -> ConnectionPool:
             connection_info,
             min_size=1,
             max_size=5,
+            timeout=60,  # Increased timeout for Render database initialization
             kwargs={"row_factory": dict_row},
             open=True,
         )
