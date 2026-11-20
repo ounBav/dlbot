@@ -1,0 +1,116 @@
+# Render Blueprint: web webhook + background worker + Postgres + Key Value (Redis)
+services:
+  - type: web
+    name: bot-webhook
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: TERMS_URL
+        sync: false
+      - key: DB_HOST
+        fromDatabase:
+          name: bot-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: bot-db
+          property: port
+      - key: DB_SCHEMA
+        fromDatabase:
+          name: bot-db
+          property: database
+      - key: DB_USERNAME
+        fromDatabase:
+          name: bot-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: bot-db
+          property: password
+      - key: DB_CONNECTION
+        value: postgres
+      - key: DB_LOGGING
+        value: "false"
+      - key: DB_SYNC
+        value: "true"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: bot-redis
+          property: connectionString
+      - key: MAX_UPLOAD_MB
+        value: "50"
+      - key: RATE_PER_MINUTE
+        value: "5"
+      - key: RATE_PER_DAY
+        value: "30"
+      - key: TEMP_DIR
+        value: /tmp/dlbot
+
+  - type: worker
+    name: bot-worker
+    runtime: docker
+    plan: standard
+    dockerCommand: python -m app.worker
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DB_HOST
+        fromDatabase:
+          name: bot-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: bot-db
+          property: port
+      - key: DB_SCHEMA
+        fromDatabase:
+          name: bot-db
+          property: database
+      - key: DB_USERNAME
+        fromDatabase:
+          name: bot-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: bot-db
+          property: password
+      - key: DB_CONNECTION
+        value: postgres
+      - key: DB_LOGGING
+        value: "false"
+      - key: DB_SYNC
+        value: "true"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: bot-redis
+          property: connectionString
+      - key: MAX_UPLOAD_MB
+        value: "50"
+      - key: WORKER_CONCURRENCY
+        value: "2"
+      - key: MAX_JOB_ATTEMPTS
+        value: "3"
+      - key: TEMP_DIR
+        value: /tmp/dlbot
+
+databases:
+  - name: bot-db
+    plan: basic-256mb
+
+keyValue:
+  - name: bot-redis
+    plan: starter
+    # Must NOT evict: the job queue lives in Redis. Cache keys carry TTLs instead.
+    maxmemoryPolicy: noeviction
+    ipAllowList: []

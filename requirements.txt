@@ -1,0 +1,9 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+httpx>=0.27,<1
+pydantic-settings>=2.4,<3
+redis>=5.0,<6
+psycopg[binary]>=3.2,<4
+psycopg-pool>=3.2,<4
+# TODO(spike): pin to an exact version after the yt-dlp spike (NFR-09)
+yt-dlp>=2025.1.0

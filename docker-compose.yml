@@ -1,0 +1,42 @@
+# Local development: the same images as production, with Postgres and Redis.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: bot
+      POSTGRES_DB: bot
+    ports: ["5432:5432"]
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory-policy noeviction
+    ports: ["6379:6379"]
+
+  web:
+    build: .
+    env_file: .env
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_SCHEMA: bot
+      DB_USERNAME: bot
+      DB_PASSWORD: bot
+      DB_CONNECTION: postgres
+      REDIS_URL: redis://redis:6379/0
+    ports: ["8000:8000"]
+    depends_on: [db, redis]
+
+  worker:
+    build: .
+    command: python -m app.worker
+    env_file: .env
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_SCHEMA: bot
+      DB_USERNAME: bot
+      DB_PASSWORD: bot
+      DB_CONNECTION: postgres
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [db, redis]
