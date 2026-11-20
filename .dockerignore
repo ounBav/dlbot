@@ -1,0 +1,14 @@
+.env
+.env.example
+.git
+.gitignore
+.pytest_cache
+__pycache__
+*.pyc
+.venv
+*.egg-info
+.claude
+render.yaml
+README.md
+DEVOPS_TROUBLESHOOTING.md
+RENDER_DEPLOY.md

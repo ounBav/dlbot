@@ -14,8 +14,6 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY . .
-# Remove .env — use only runtime environment variables
-RUN rm -f .env
 
 RUN useradd --create-home appuser
 USER appuser

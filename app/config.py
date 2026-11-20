@@ -1,8 +1,11 @@
+import logging
 import os
 from functools import lru_cache
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+log = logging.getLogger("config")
 
 # Load .env only in development (not present in Docker image)
 _env_file = ".env" if os.path.exists(".env") else None
@@ -44,4 +47,21 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+
+    # CRITICAL: Verify database host is NOT localhost in production (Render)
+    if settings.db_host in ("localhost", "127.0.0.1", "::1"):
+        # This is OK in development, but log it
+        if _env_file:
+            log.info(f"Development mode: DB_HOST={settings.db_host} (from .env)")
+        else:
+            # Production should NEVER use localhost
+            log.error(f"ERROR: DB_HOST is {settings.db_host} but .env not found!")
+            log.error("RENDER MUST inject DB_HOST from managed database!")
+            log.error("Check: Render Dashboard → bot-webhook → Environment")
+            raise ValueError(
+                f"Invalid DB_HOST: {settings.db_host}. "
+                "In production, Render must auto-link the database host."
+            )
+
+    return settings
