@@ -1,4 +1,7 @@
 # Local development: the same images as production, with Postgres and Redis.
+# Own project name so it never clashes with the root Flask API compose (also "dlbot").
+name: dlbot-bot
+
 services:
   db:
     image: postgres:16-alpine
@@ -24,12 +27,16 @@ services:
       DB_PASSWORD: bot
       DB_CONNECTION: postgres
       REDIS_URL: redis://redis:6379/0
-    ports: ["8000:8000"]
+    # 8082 is the port the local ngrok tunnel forwards to (scripts/ngrok_webhook.py --port 8082)
+    ports: ["8000:8000", "8082:8000"]
     depends_on: [db, redis]
 
   worker:
     build: .
     command: python -m app.worker
+    # The image HEALTHCHECK curls /health, which only the web service serves.
+    healthcheck:
+      disable: true
     env_file: .env
     environment:
       DB_HOST: db

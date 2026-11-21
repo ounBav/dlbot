@@ -40,6 +40,15 @@ class TelegramClient:
             if "not modified" not in str(exc):
                 raise
 
+    def set_commands(self, commands: list[tuple[str, str]]) -> None:
+        """Register the bot's command menu for private chats (shown under the Menu button)."""
+        self.call(
+            "setMyCommands",
+            commands=[{"command": c, "description": d} for c, d in commands],
+            scope={"type": "all_private_chats"},
+        )
+        self.call("setChatMenuButton", menu_button={"type": "commands"})
+
     def answer_callback(self, callback_id: str) -> None:
         self.call("answerCallbackQuery", callback_query_id=callback_id)
 

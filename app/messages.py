@@ -40,6 +40,15 @@ NO_ACTIVE_JOB = "There is no active download to cancel."
 CACHED_CAPTION = "♻️ Sent from cache"
 ADMIN_USAGE = "Usage: /admin stats | /admin ban <telegram_id> | /admin unban <telegram_id>"
 
+# Telegram "Menu" button (setMyCommands). Same wording as HELP. /admin is deliberately hidden.
+BOT_COMMANDS = [
+    ("start", "Welcome message"),
+    ("help", "How to use this bot"),
+    ("status", "Your usage today"),
+    ("cancel", "Cancel your active download"),
+    ("terms", "Acceptable use"),
+]
+
 ERROR_TEXT = {
     "E-UNSUPPORTED": "❌ I can't read that link. I support public TikTok, YouTube and Facebook videos.",
     "E-PRIVATE": "🔒 This video is private or needs a login, so I can't download it.",

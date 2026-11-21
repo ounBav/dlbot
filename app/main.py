@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 
-from . import db, store
+from . import db, messages, store
 from .config import get_settings
 from .handlers import handle_update
 from .log import setup_logging
@@ -44,6 +44,10 @@ async def lifespan(_: FastAPI):
             await asyncio.sleep(wait_time)
 
     tg_client = TelegramClient(get_settings().bot_token)
+    try:
+        tg_client.set_commands(messages.BOT_COMMANDS)  # idempotent; refreshes the Menu button
+    except Exception:
+        log.exception("could not register bot commands")  # never block startup on this
     yield
     tg_client.http.close()
 

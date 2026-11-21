@@ -1,14 +1,16 @@
+# Keep the build context tiny; the Dockerfile copies only app/, migrations/, scripts/.
 .env
-.env.example
+.env.*
 .git
+.github
 .gitignore
 .pytest_cache
-__pycache__
-*.pyc
 .venv
-*.egg-info
 .claude
+**/__pycache__
+*.pyc
+*.egg-info
+tests
+*.md
 render.yaml
-README.md
-DEVOPS_TROUBLESHOOTING.md
-RENDER_DEPLOY.md
+docker-compose.yml

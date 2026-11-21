@@ -1,11 +1,20 @@
 # Render Blueprint: web webhook + background worker + Postgres + Key Value (Redis)
+#
+# Fast deploys: Render does NOT build anything. GitHub Actions (.github/workflows/deploy.yml)
+# runs the tests, builds ONE image, pushes it to GHCR, then calls each service's deploy hook
+# with ?imgURL=ghcr.io/ounbav/dlbot:<commit-sha>. Image-backed services never auto-deploy,
+# so a push that fails tests never reaches Render. See RENDER_DEPLOY.md for first-time setup.
 services:
   - type: web
     name: bot-webhook
-    runtime: docker
+    runtime: image
+    image:
+      url: ghcr.io/ounbav/dlbot:latest
+      creds:
+        fromRegistryCreds:
+          name: ghcr-dlbot   # Workspace Settings → Container Registry Credentials
     plan: starter
     healthCheckPath: /health
-    autoDeploy: true
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -59,7 +68,12 @@ services:
 
   - type: worker
     name: bot-worker
-    runtime: docker
+    runtime: image
+    image:
+      url: ghcr.io/ounbav/dlbot:latest   # same image as the web service
+      creds:
+        fromRegistryCreds:
+          name: ghcr-dlbot
     plan: standard
     dockerCommand: python -m app.worker
     envVars:
@@ -105,13 +119,13 @@ services:
       - key: TEMP_DIR
         value: /tmp/dlbot
 
-databases:
-  - name: bot-db
-    plan: basic-256mb
-
-keyValue:
-  - name: bot-redis
+  - type: keyvalue
+    name: bot-redis
     plan: starter
     # Must NOT evict: the job queue lives in Redis. Cache keys carry TTLs instead.
     maxmemoryPolicy: noeviction
-    ipAllowList: []
+    ipAllowList: []   # internal connections only
+
+databases:
+  - name: bot-db
+    plan: basic-256mb

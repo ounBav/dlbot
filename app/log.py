@@ -28,3 +28,6 @@ def setup_logging() -> None:
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(logging.INFO)
+    # NFR-05: httpx/httpcore log full request URLs at INFO, and Telegram URLs contain the bot token.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)

@@ -1,9 +1,11 @@
-fastapi>=0.115,<1
-uvicorn[standard]>=0.30,<1
-httpx>=0.27,<1
-pydantic-settings>=2.4,<3
-redis>=5.0,<6
-psycopg[binary]>=3.2,<4
-psycopg-pool>=3.2,<4
-# TODO(spike): pin to an exact version after the yt-dlp spike (NFR-09)
-yt-dlp>=2025.1.0
+# Exact pins (NFR-09): reproducible builds and a stable Docker layer cache.
+# Versions are the ones verified running in the local stack on 2026-11-21.
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
+httpx==0.28.1
+pydantic-settings==2.16.3
+redis==5.3.1
+psycopg[binary]==3.3.9
+psycopg-pool==3.3.3
+# Bump deliberately when an extractor breaks; re-run the smoke test after.
+yt-dlp==2026.10.26
