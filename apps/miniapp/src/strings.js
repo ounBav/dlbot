@@ -1,11 +1,14 @@
 // All Mini App copy lives here (same rule as apps/bot/app/messages.py). Keys are stable for i18n.
 // Tone and error meanings mirror the bot's messages.py so chat and app say the same thing.
+// DRAFT (2026-11-22): keys marked "draft" were added for the preview/save-to-device flow and still
+// need product sign-off. Existing wording is unchanged.
 
 export const S = {
   appTitle: "Media Downloader",
   greeting: (name) => (name ? `Hi, ${name}` : "Hi there"),
   usage: (used, limit) => `${used}/${limit} today`,
   usageFull: "Daily limit reached",
+  tagline: "Save videos & audio from YouTube, TikTok and Facebook", // draft
 
   linkLabel: "Video link",
   linkPlaceholder: "Paste a TikTok, YouTube or Facebook link",
@@ -20,15 +23,30 @@ export const S = {
   videoHint: "MP4, plays inline",
   audioHint: "MP3, 128 kbps",
   limitHint: (mb) => `Files up to ${mb} MB. The file is sent to your chat with the bot.`,
-  submit: (fmt) => (fmt === "audio" ? "Download audio" : "Download video"),
-  submitting: "Sending…",
+  sizeHint: (mb) => `Files up to ${mb} MB.`, // draft
+  continue: "Continue", // draft
+  supported: "Works with", // draft
   waitFor: (t) => `Try again in ${t}`,
 
+  // Preview (draft)
+  qualityLabel: "Quality",
+  deliveryLabel: "Deliver to",
+  toDevice: "This device",
+  toChat: "Bot chat",
+  toChatHint: "The file is sent to your chat with the bot.",
+  toDeviceHint: (min) => `You get a download link, valid for ${min} min.`,
+  downloadVideo: (q) => (q ? `Download MP4 · ${q}p` : "Download MP4"),
+  downloadAudio: "Download MP3",
+  noVideoTrack: "This link has no video track, so only audio is available.",
+  previewLoading: "Reading the link…",
+
+  // Progress
   activeTitle: "In progress",
   steps: { queued: "Queued", downloading: "Downloading", uploading: "Sending" },
   status: {
     queued: "Waiting in the queue…",
     downloading: "Downloading…",
+    processing: "Converting…", // draft
     retrying: "A temporary problem occurred. Retrying…",
     uploading: "Almost done, sending your file…",
     cancelling: "Cancelling…",
@@ -37,11 +55,29 @@ export const S = {
     cancelled: "Cancelled",
     expired: "Timed out",
   },
+  downloadingPct: (pct) => `Downloading… ${pct}%`, // draft
+  keepOpen: "You can keep using Telegram. Come back here to save the file.", // draft
   cancel: "Cancel",
   cancelConfirm: "Cancel this download?",
+  cancelledToast: "Download cancelled.", // draft
+
+  // Ready (draft)
+  readyTitle: "Your file is ready",
+  sentTitle: "Sent to your chat",
+  sentBody: "Open the chat with the bot to watch or save it.",
+  cachedSent: "Sent instantly. Check your chat.",
+  saveToDevice: "Save to device",
+  saveStarted: "Download started. Check your downloads.",
+  expiresIn: (min) => `The link expires ${min} min after the file is ready.`,
+  another: "Download another",
   openChat: "Open chat",
+
+  // Error screen (draft titles)
+  errorTitle: "Couldn't download this",
   tryAudio: "Try audio instead",
+  lowerQuality: (q) => `Try ${q}p`,
   retry: "Try again",
+  back: "Back",
   dismiss: "Dismiss",
 
   historyTitle: "Recent downloads",
@@ -49,8 +85,6 @@ export const S = {
   refresh: "Refresh",
   reuse: "Use this link again",
 
-  cachedSent: "Sent instantly. Check your chat.",
-  queuedToast: "Added to the queue. Your file will arrive in the chat.",
   copiedHint: "Long-press the field and choose Paste.",
 
   terms: "Terms of use",
@@ -59,6 +93,7 @@ export const S = {
   // Full-screen states
   outsideTitle: "Open this in Telegram",
   outsideBody: "This app runs inside Telegram. Open the bot and tap the Download button.",
+  openInTelegram: "Open in Telegram", // draft
   authTitle: "Session expired",
   authBody: "Close the app and open it again from the bot.",
   bannedTitle: "Access restricted",
@@ -79,6 +114,16 @@ export const S = {
     "E-NOTFOUND": "That download no longer exists.",
     "E-NETWORK": "Can't reach the server. Check your connection and try again.",
     "E-EXPIRED": "This download took too long and was dropped. Please try again.",
+    // draft
+    "E-TOOBIG-Q": (mb) => `At this quality the file is over ${mb} MB. Pick a lower quality or Audio.`,
+    "E-BUSY": "You already have a download running. Wait for it to finish.",
+    "E-LIVE": "Live streams and premieres can't be downloaded. Try again after it ends.",
+    "E-PLAYLIST": "That's a playlist. Send a link to a single video.",
+    "E-TOOLONG": "This video is too long for the downloader.",
+    "E-BLOCKED": "YouTube is blocking our server right now. Please try again later.",
+    "E-GEO": "This video isn't available in the server's region.",
+    "E-UNAVAILABLE": "This video was removed or isn't available.",
+    "E-GONE": "The download link has expired. Download the file again.",
   },
 };
 

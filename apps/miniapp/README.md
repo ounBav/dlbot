@@ -1,8 +1,14 @@
 # Mini App (`apps/miniapp`)
 
-Telegram Mini App for the media downloader bot. Users paste a link, pick Video or Audio, and
-watch progress. The file itself is still delivered **in the bot chat** by the worker; the app never
-serves media.
+Telegram Mini App for the media downloader bot. Flow: **home** (paste a link) → **preview**
+(thumbnail, title, Video/Audio, quality, delivery) → **progress** (live percentage, cancel) →
+**ready** (save the file) or **error** (specific message plus the next step).
+
+Two deliveries:
+- **This device** (default): the worker keeps the finished file for `FILE_TTL_MIN` (15 min) behind
+  `GET /api/files/<token>`; **Save to device** calls `Telegram.WebApp.downloadFile` (Bot API 8.0+)
+  or falls back to `openLink`.
+- **Bot chat**: the worker sends the file to the user's chat, exactly like the chat flow.
 
 Static HTML/CSS/ES modules. No build step, no npm dependencies; only Telegram's
 `telegram-web-app.js` is loaded at runtime.
@@ -13,8 +19,8 @@ Static HTML/CSS/ES modules. No build step, no npm dependencies; only Telegram's
 |---|---|
 | `index.html` | Page shell. All visible text is bound from `src/strings.js` via `data-s` attributes. |
 | `styles.css` | Uses Telegram theme variables (`--tg-theme-*`), with light/dark fallbacks. |
-| `config.js` | `window.MINIAPP_CONFIG.apiBase`. Generated on Render from `API_BASE_URL`. |
-| `src/app.js` | Controller: Telegram SDK, form, MainButton, polling, rendering. |
+| `config.js` | `window.MINIAPP_CONFIG` = `{apiBase, botUsername}`. Generated on Render from `API_BASE_URL` and `BOT_USERNAME`. |
+| `src/app.js` | Controller: screen state machine, Telegram SDK (MainButton/BackButton, haptics, theme, closing confirmation), polling, session resume. |
 | `src/api.js` | Client for `apps/bot/app/api.py` (`Authorization: tma <initData>`). |
 | `src/logic.js` | Pure helpers (URL detection, stages, backoff). Unit-tested. |
 | `src/strings.js` | **All user-facing copy.** Error meanings mirror `apps/bot/app/messages.py`. |
@@ -23,16 +29,23 @@ Static HTML/CSS/ES modules. No build step, no npm dependencies; only Telegram's
 ## How it talks to the bot
 
 ```
-Mini App ── GET  /api/me ──────────────▶ user, usage today, limits, platform allow-list
-         ── POST /api/downloads ───────▶ bot posts a status message in the user's chat,
-                                         job is queued (or a cached file is sent at once)
-         ── GET  /api/downloads ───────▶ last 20 jobs with live stage (polled while any job is active)
+Mini App ── GET  /api/me ──────────────▶ user, usage, limits, platform allow-list, qualities, file TTL
+         ── POST /api/info ────────────▶ preview: title, uploader, duration, thumbnail, qualities
+         ── POST /api/downloads ───────▶ {url, format, quality?, delivery} → job id
+                                         (409 E-BUSY with the running job's id: one job per user)
+         ── GET  /api/downloads/{id} ──▶ status, progress 0-1, file {name, size, download_path, expires_at}
          ── POST /api/downloads/{id}/cancel
+         ── GET  /api/downloads ───────▶ recent downloads (home screen)
+Telegram ── GET  /api/files/{token} ───▶ the file (attachment; token instead of initData; 410 when expired)
 ```
 
 - **Auth:** the server validates Telegram's signed `initData`. The app never trusts `initDataUnsafe`.
-- **Polling:** a single list request every 1.5 s, backing off to 3 s and then 6 s. It stops when every
-  job is final (`done | failed | cancelled | expired`) and pauses while the app is hidden.
+- **Polling:** `GET /api/downloads/{id}` every 1.5 s while a job runs; on network errors it backs off
+  (3 s, 6 s, 12 s). It pauses while the app is hidden and resumes on return.
+- **Resume:** the active job id is kept in `sessionStorage`; reopening the app returns to its progress
+  or ready screen.
+- **Cache busting:** Telegram's webview caches hard. Bump `?v=` in `index.html` and the imports at the
+  top of `src/app.js` together on every release (the static site also sends `no-cache`).
 - **E-NOCHAT:** if the user never pressed Start, the app asks Telegram for write access
   (`requestWriteAccess`, Bot API 6.9+), then retries once.
 - **Platform hints** use the host list returned by `/api/me`, so the app and the server can't disagree.
