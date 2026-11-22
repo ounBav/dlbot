@@ -1,113 +1,85 @@
 # Render Deployment Guide
 
-## How deploys work
+## What runs on Render
+
+| Service | Type | What it does |
+|---|---|---|
+| bot (`bot-webhook` in `render.yaml`, or your existing Docker web service) | Web service, Docker, **1 instance** | Telegram long polling + download workers + `/health` + Mini App `/api` |
+| `bot-miniapp` | Static site | Mini App files (optional) |
+
+There is **no** Postgres, Redis, background worker, webhook or ngrok. State is in memory, so a deploy or
+restart clears the queue, bans, stats and the "instant resend" cache. That is expected.
 
 ```text
-git push main ──▶ GitHub Actions
-                   1. test    compileall + pytest          (~30 s)
-                   2. build   ONE image → ghcr.io/ounbav/dlbot:<sha>   (cached: ~30–60 s)
-                   3. deploy  Render deploy hooks (web + worker) with ?imgURL=…:<sha>
-Render ──▶ pull image ──▶ start      (no build on Render; usually 1–2 min)
+git push main ──▶ GitHub Actions: compileall + pytest + docker build   (checks only)
+              └─▶ Render: build root Dockerfile ──▶ /health OK ──▶ swap ──▶ old instance stops
 ```
 
-- Render never builds. Both services run the same image; the worker just overrides the command.
-- A push that fails tests never reaches Render (image services don't auto-deploy).
-- Pushes that only change `*.md` files don't run the pipeline.
-- Every deploy is pinned to a commit SHA, so Render's **Rollback** works.
+- Render rebuilds the bot only when `apps/bot/app/**`, `apps/bot/requirements.txt`, `Dockerfile`,
+  `.dockerignore` or `render.yaml` change (`buildFilter`). Docs/tests/scripts/Mini App pushes skip it.
+- A code-only change rebuilds one image layer (dependencies and ffmpeg are cached): the build takes
+  seconds, then Render waits for `/health`.
 
-## One-time setup
+## Rules that keep the bot working
 
-Do these in order. Steps 1–3 are only needed once.
+1. **One poller per bot token.** Only one process in the world may call `getUpdates` for a token.
+   Stop the local bot (`docker compose stop bot`) before Render runs with the same token, or use a
+   separate dev bot locally. Two pollers log `409 conflict` and steal each other's messages.
+2. **One instance, one process.** `numInstances: 1` and `uvicorn --workers 1`. Never scale out.
+3. **A plan that does not sleep.** Polling only runs while the process is up. Free web services sleep
+   after idle time and stop receiving messages. Use `starter` or higher.
+4. **No webhook.** The bot deletes any webhook on startup. Do not run a `setWebhook` script anymore.
 
-### 1. Push the code so the first image exists
+## Environment variables
 
-```bash
-git push origin main
-```
+| Key | Required | Example / default |
+|---|---|---|
+| `BOT_TOKEN` | yes | from @BotFather |
+| `ADMIN_IDS` | recommended | `123456789,987654321` |
+| `TERMS_URL` | optional | `https://example.com/terms` |
+| `MINIAPP_URL` | optional | `https://bot-miniapp.onrender.com/` (enables the Mini App button) |
+| `POLL_TIMEOUT` | no | `25` |
+| `MAX_UPLOAD_MB`, `RATE_PER_MINUTE`, `RATE_PER_DAY` | no | `50`, `5`, `30` |
+| `WORKER_CONCURRENCY`, `MAX_JOB_ATTEMPTS`, `TEMP_DIR` | no | `2`, `3`, `tmp` |
 
-Open **GitHub → Actions → deploy**. `test` and `build` should pass. `deploy` will warn
-"hooks not set" — that's expected the first time.
+Delete leftovers from the old setup; they are ignored but confusing: `DATABASE_URL`, `DB_*`,
+`REDIS_URL`, `WEBHOOK_SECRET`, `PUBLIC_BASE_URL`.
 
-### 2. Let Render pull the private image
+## Deploy: existing Docker web service (e.g. `dlbot-d2zj`)
 
-1. GitHub → **Settings → Developer settings → Personal access tokens → Tokens (classic)**
-   → new token with only **`read:packages`**.
-2. Render → **Workspace Settings → Container Registry Credentials → Add**
-   - Name: **`ghcr-dlbot`** (must match `render.yaml`)
-   - Registry: GitHub Container Registry
-   - Username: your GitHub username
-   - Token: the token from step 2.1
+1. **Settings**: Runtime Docker, Dockerfile path `./Dockerfile`, Docker build context `.`,
+   Health check path `/health`, Instances 1, plan `starter` or higher.
+   Optional, for faster deploys: **Build Filters → Included paths** = the list from `render.yaml`.
+2. **Environment**: set the variables above and delete the leftovers.
+3. Delete old services if they still exist: `bot-worker`, `bot-redis`, `bot-db` (they cost money).
+4. Stop the local bot: `docker compose stop bot`.
+5. Push to `main` (Auto-Deploy on), or **Manual Deploy → Deploy latest commit**.
 
-### 3. Create or update the Blueprint
+## Deploy: new Blueprint
 
-Render → **New → Blueprint** → this repo, branch `main` (or **Blueprints → Sync** if it exists).
+**New → Blueprint** → select the repo → Render reads `render.yaml` → fill `BOT_TOKEN`, `ADMIN_IDS`,
+`TERMS_URL`, `MINIAPP_URL` and (for `bot-miniapp`) `API_BASE_URL` = the bot service URL. Then step 4 above.
 
-Fill the `sync: false` variables:
+## Verify (2 minutes)
 
-| Variable | Value |
-|---|---|
-| `BOT_TOKEN` | Token from @BotFather (both services) |
-| `PUBLIC_BASE_URL` | `https://bot-webhook-xxxx.onrender.com` (after the first deploy) |
-| `ADMIN_IDS` | Your Telegram user ID (comma-separated for several) |
-| `TERMS_URL` | Link to your terms page |
-
-`WEBHOOK_SECRET`, database and Redis values are generated and linked automatically.
-
-> **Existing services built with `runtime: docker`:** Render may refuse to switch an existing
-> service to `runtime: image` during a sync. If it does, delete only **bot-webhook** and
-> **bot-worker** (not `bot-db` / `bot-redis` — your data lives there) and sync again.
-
-### 4. Connect GitHub Actions to Render
-
-1. Render → **bot-webhook → Settings → Deploy Hook** → copy the URL.
-2. Render → **bot-worker → Settings → Deploy Hook** → copy the URL.
-3. GitHub → **Settings → Secrets and variables → Actions → New repository secret**
-   - `RENDER_DEPLOY_HOOK_WEB` = web hook URL
-   - `RENDER_DEPLOY_HOOK_WORKER` = worker hook URL
-
-Deploy hook URLs are secrets: anyone with one can trigger a deploy.
-
-### 5. Register the Telegram webhook
-
-With the production values (`WEBHOOK_SECRET` is on the bot-webhook **Environment** tab):
-
-```bash
-BOT_TOKEN=... WEBHOOK_SECRET=... PUBLIC_BASE_URL=https://bot-webhook-xxxx.onrender.com \
-  DB_HOST=x DB_SCHEMA=x DB_USERNAME=x DB_PASSWORD=x REDIS_URL=redis://x \
-  PYTHONPATH=. python scripts/set_webhook.py
-```
-
-(The `DB_*`/`REDIS_URL` placeholders only satisfy settings validation; the script calls Telegram only.)
-Telegram keeps this webhook until you change it, so this is once per URL, not per deploy.
-
-### 6. Test
-
-Re-run the workflow (**Actions → deploy → Run workflow**), then send a link to the bot.
-
-## Everyday use
-
-| Want to… | Do |
-|---|---|
-| Deploy | `git push origin main` |
-| Redeploy without code changes | Actions → deploy → **Run workflow** |
-| Roll back | Render → service → **Rollback** to an earlier deploy |
-| Bump yt-dlp | Edit the pin in `requirements.txt`, push |
+1. Render **Logs** show, in order:
+   `workers started` → `polling started` → `Uvicorn running on http://0.0.0.0:10000` → `Your service is live`.
+2. `curl https://<service>.onrender.com/health` →
+   `{"status":"ok","queued":0,"polling":true}` (`polling` turns true after the first successful poll).
+3. In Telegram: `/start`, then send a YouTube/TikTok link → 🎬 / 🎵 buttons → the file arrives.
 
 ## Troubleshooting
 
-| Symptom | Cause / fix |
-|---|---|
-| Render: `failed to read dockerfile: open Dockerfile: no such file or directory` | Service is still `runtime: docker` and builds `./Dockerfile` from the repo root. The Dockerfile must stay at the repo root (it builds `apps/bot/` with root context). Don't move it back into `apps/bot/` without also changing the service's Dockerfile path and context. |
-| Render: "failed to pull image" / unauthorized | Credential name isn't `ghcr-dlbot`, or the token lacks `read:packages` |
-| Actions `deploy`: HTTP 400 | Image URL in `render.yaml` doesn't match `ghcr.io/<owner>/<repo>` (must be lowercase) |
-| Actions `deploy`: HTTP 404 | Deploy hook secret is wrong or was regenerated |
-| `deploy` job skipped with a warning | Hook secrets not set (step 4) |
-| "Connection refused" in logs on first boot | DB still provisioning; web retries migrations, then restart once |
-| Telegram not delivering | Re-run step 5; check `getWebhookInfo` `last_error_message` |
+| Log / symptom | Cause | Fix |
+|---|---|---|
+| `409 conflict, another bot instance is polling` (continuous) | Same token polled elsewhere (local Docker, an old Render service) | Stop the other one. A few 409s during a deploy are normal: old and new instance overlap briefly. |
+| `bot token rejected (401)` | Wrong `BOT_TOKEN` | Fix the env var; Render restarts the service. |
+| `"polling": false` stays false | Telegram unreachable or token wrong | Check the two lines above in the logs. |
+| Bot silent after some idle time | Free plan went to sleep | Upgrade the plan (rule 3). |
+| `Port scan timeout reached, no open ports` | Service is not a web service, or custom start command | Use the Dockerfile `CMD` (binds `$PORT`). |
+| `E-TOOBIG` replies | File over 50 MB (Telegram bot upload limit) | Expected; user can choose 🎵 Audio. |
+| YouTube `Sign in to confirm you're not a bot` | YouTube blocks Render's datacenter IPs | Owner decision (CLAUDE.md Open Questions); do not add cookies/proxies without approval. |
 
-## Resources
+## Rollback
 
-- [Render: Deploy a prebuilt image](https://render.com/docs/deploying-an-image)
-- [Render: Deploy hooks](https://render.com/docs/deploy-hooks)
-- [Render: Blueprint spec](https://render.com/docs/blueprint-spec)
-- [Telegram Bot API: setWebhook](https://core.telegram.org/bots/api#setwebhook)
+Render → the service → **Events** → pick the previous successful deploy → **Rollback**.

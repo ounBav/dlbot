@@ -17,42 +17,42 @@ This file is the source of truth for Claude Code. Read it fully before changing 
 | Layer | Choice | Notes |
 |---|---|---|
 | Language | Python 3.12 | |
-| Webhook | FastAPI + uvicorn | Render **web service**. Must answer Telegram in <2 s. Enqueue only, never download here. |
-| Worker | Plain Python process (`python -m app.worker`) | Render **background worker**. Downloads, uploads, cleans up. |
-| Queue / cache / rate limit | Redis (Render Key Value) | TCP `redis://` URL. Eviction policy **must be `noeviction`** (queue must not be evicted). |
-| Database | PostgreSQL (Render Postgres) | Users, request log, media cache metadata, admin audit. |
+| Updates | Telegram long polling (`app/poller.py`, `getUpdates`) | Thread in the web process. No webhook, no public URL, no tunnel (owner decision, 2026-11-22). One poller per bot token. |
+| HTTP | FastAPI + uvicorn | Render **web service**, single instance, single process (`--workers 1`). Serves `/health` and the Mini App `/api` only. |
+| Worker | Threads inside the web process (`app/worker.py` `WorkerPool`) | Started/stopped by the FastAPI lifespan. `WORKER_CONCURRENCY` threads. |
+| Queue / cache / rate limit / users / request log | In-memory singleton (`app/store.py` `MemoryStore`) | No Postgres, no Redis (owner decision, 2026-11-22). Everything resets on restart/redeploy. Never scale the service beyond 1 instance/process. |
 | Download | yt-dlp + ffmpeg | Called as a Python library. Never via `shell=True` or a shell string. |
-| Telegram | Bot API over HTTPS (`httpx`) | Webhook with `secret_token`. Private chats only in v1. |
-| Hosting | Render (Blueprint in `render.yaml`) | Docker runtime for both services. |
+| Telegram | Bot API over HTTPS (`httpx`) | `getUpdates` long polling (`POLL_TIMEOUT`, default 25 s). Private chats only in v1. |
+| Hosting | Render (Blueprint in `render.yaml`) | Docker runtime, one bot service + the Mini App static site. |
 | Removed | MQTT | Out of scope. Do not reintroduce without an approved requirement. |
 
-Note: the original brief said "Vercel". Vercel is not used for the worker because downloads and ffmpeg need a persistent process. The web service runs on Render.
+Note: the original brief said "Vercel". Vercel is not used because downloads and ffmpeg need a persistent process. The bot runs on Render.
 
 ## 3. Architecture
 
 ```
-Telegram ──webhook──▶ web (FastAPI, app/main.py)
-                        │ validate secret, dedupe update_id, rate limit, route
-                        ├──▶ Redis  (req:*, queue:downloads, claim:*, cancel:*, fid:*)
-                        └──▶ Postgres (users, requests)
-Redis queue ──BRPOP──▶ worker (app/worker.py, N threads)
-                        ├── yt-dlp download to a per-job temp dir
+Telegram ◀──getUpdates── Poller thread (app/poller.py, inside the web process)
+                        │ deleteWebhook on start, offset/dedupe update_id, rate limit, route
+                        ├──▶ store (in-memory singleton: req, claim, cancel, fid, users, request log)
+                        └──▶ store.enqueue(job)  (queue.Queue)
+queue ──get──▶ WorkerPool threads (app/worker.py, same process)
+                        ├── yt-dlp download to TEMP_DIR/job-*/ (default ./tmp)
                         ├── Telegram sendVideo / sendAudio (file_id returned)
-                        ├──▶ Redis fid:* cache, Postgres media_cache + requests
-                        └── rmtree temp dir in `finally`
+                        ├──▶ store fid cache + request log
+                        └── rmtree job dir in `finally`; leftovers wiped on startup
 ```
 
 ### Module map
 
 | File | Responsibility |
 |---|---|
-| `app/main.py` | FastAPI app, `/health`, `/telegram/webhook` (secret check, dedupe, always 200) |
+| `app/main.py` | Process entry: lifespan starts/stops `Poller` + `WorkerPool`; FastAPI `/health` and Mini App `/api` |
+| `app/poller.py` | `getUpdates` loop: offset, dedupe, backoff (network, 409 conflict, 429 retry_after, 401), calls `handle_update` |
 | `app/handlers.py` | Routes messages, commands, inline callbacks. Builds jobs. No downloading. |
-| `app/worker.py` | Job loop, retries, cancel checks, status edits, cleanup |
+| `app/worker.py` | `WorkerPool` threads: job loop, retries, cancel checks, status edits, temp cleanup |
 | `app/downloader.py` | yt-dlp wrapper, `DownloadError` codes, `classify_error` |
 | `app/tg.py` | Telegram HTTP client; `TelegramError` on any `ok: false` |
-| `app/store.py` | All Redis access (queue, pending requests, cache, rate limit, cancel, heartbeat) |
-| `app/db.py` | All Postgres access and the migration runner |
+| `app/store.py` | All state: in-memory `MemoryStore` singleton (queue, pending requests, cache, rate limit, cancel, users/bans, request log, stats) |
 | `app/messages.py` | **All user-facing text.** Never hard-code user strings elsewhere. |
 | `app/url_utils.py` | URL extraction, host allow-list, `url_hash` |
 | `app/config.py` | `Settings` (pydantic-settings), read from env / `.env` |
@@ -60,23 +60,21 @@ Redis queue ──BRPOP──▶ worker (app/worker.py, N threads)
 | `app/api.py` | Mini App HTTP API under `/api` (me, create/list/get/cancel downloads). Read-only on polls. |
 | `app/jobs.py` | `submit()`: cache hit or enqueue. Shared by chat callbacks and the Mini App API. |
 | `app/webapp_auth.py` | Validates Mini App `initData` (HMAC with the bot token, `auth_date` max age) |
-| `migrations/*.sql` | Schema. Applied on web startup. Must be idempotent. |
-| `scripts/set_webhook.py` | One-off: register the Telegram webhook |
 
 Paths above are relative to `apps/bot/`. The repo is a monorepo:
 
 | Path | What |
 |---|---|
-| `apps/bot/` | Python web + worker (one Docker image) |
+| `apps/bot/` | Python bot: long polling + in-process workers (one Docker image, one process) |
 | `apps/miniapp/` | Telegram Mini App: static HTML/CSS/ES modules, no build, no deps. See its README. Copy lives in `src/strings.js`. Tests: `npm test` (Node 20+). Hosted as the Render static site `bot-miniapp`. |
 
-Mini App job stages (Redis `job:<db_id>`, then the DB): `queued → downloading → (retrying) → uploading → done | failed | cancelled`. The API reports `expired` when a job is not final, its progress hash is gone, and it is older than `REQUEST_TTL`.
+Mini App job stages (store progress `job:<db_id>`, then the request log): `queued → downloading → (retrying) → uploading → done | failed | cancelled`. The API reports `expired` when a job is not final, its progress hash is gone, and it is older than `REQUEST_TTL`.
 
 ### Callback protocol
 
-`callback_data` is `dl|<v|a>|<token>` (≤64 bytes). The **token** keys a Redis entry `req:<token>` holding `{url, platform, user_id}` for 1 hour. Never put a URL directly in callback data.
+`callback_data` is `dl|<v|a>|<token>` (≤64 bytes). The **token** keys a store entry `req:<token>` holding `{url, platform, user_id}` for 1 hour. Never put a URL directly in callback data.
 
-### Job payload (Redis list `queue:downloads`)
+### Job payload (in-memory `queue.Queue` in `store`)
 
 ```json
 {"token": "...", "db_id": "uuid", "fmt": "video|audio", "url": "...", "platform": "youtube|tiktok|facebook",
@@ -104,22 +102,22 @@ Reference IDs from the system analysis. Implement and test each.
 | FR-04 | TikTok no-watermark when the extractor exposes it; otherwise say so | **TODO** (see Phase 3) |
 | FR-05 | Reject invalid/unsupported links clearly | Done |
 | FR-06 | Progress states queued → downloading → uploading | Done (message edits) |
-| FR-07 | Rate limit 5/min, 30/day, configurable | Done (`store.rate_limit_hit`). Needs a test. |
+| FR-07 | Rate limit 5/min, 30/day, configurable | Done (`store.rate_limit_hit`, tested) |
 | FR-08 | Refuse files over limit, suggest audio | Done |
-| FR-09 | Instant resend via cached `file_id` | Done (Redis). Postgres `media_cache` is write-only for now. |
-| FR-10 | Log each request | Done (`requests` table) |
-| FR-11 | Admin ban/unban | Done (`/admin ban|unban`) |
+| FR-09 | Instant resend via cached `file_id` | Done (in memory; lost on restart) |
+| FR-10 | Log each request | Done (in-memory request log, last 5000, lost on restart) + JSON logs |
+| FR-11 | Admin ban/unban | Done (`/admin ban|unban`; bans are in memory and reset on restart) |
 | FR-12 | Second language via `/language` | **Not started** (Could priority) |
 
 Commands: `/start /help /status /cancel /terms /admin`. Plus `/language` when FR-12 is built.
 
 ## 5. Non-functional requirements (must hold)
 
-- **NFR-01** webhook returns 200 within 2 s. Keep handler work small.
+- **NFR-01** update handling stays small (route + enqueue): updates are processed in order on the poller thread, so a slow handler delays everyone.
 - **NFR-03** failed jobs retry with backoff; updates are idempotent (`dedupe_update`).
 - **NFR-05** verify `X-Telegram-Bot-Api-Secret-Token` with `hmac.compare_digest`. Never log the bot token.
 - **NFR-06** only allow-listed hosts reach yt-dlp. No shell. SSRF: never fetch a URL that isn't on the allow-list.
-- **NFR-07** temp media is deleted in `finally`. Request logs retained 90 days (add a cleanup job in Phase 5).
+- **NFR-07** temp media is deleted in `finally`; leftover `job-*` folders are removed on startup. The request log is in memory only (bounded).
 - **NFR-08** JSON logs; alert when error rate >20% over 15 min (configure in Render, Phase 6).
 - **NFR-09** yt-dlp pinned to an exact version. Weekly smoke-test job (Phase 5).
 
@@ -145,15 +143,12 @@ pytest -q
 # Mini App (from apps/miniapp)
 npm run check && npm test
 
-# local stack (web :8000, worker, postgres, redis)
-cp .env.example .env && docker compose up --build
+# local stack: bot (polling + workers, :8000 /health) and Mini App :5173. Use a dev bot token.
+cp apps/bot/.env.example apps/bot/.env && docker compose up --build
 
-# run without docker (needs local postgres + redis + ffmpeg)
-uvicorn app.main:app --reload --port 8000     # terminal 1
-python -m app.worker                          # terminal 2
+# run without docker (needs ffmpeg). One process runs polling + workers.
+uvicorn app.main:app --port 8000
 
-# register webhook (after public URL exists, e.g. ngrok locally or Render in prod)
-PYTHONPATH=. python scripts/set_webhook.py
 ```
 
 ## 8. Build plan for Claude Code (do in order)
@@ -163,13 +158,13 @@ Each phase ends with a verification gate. Do not start the next phase until the 
 ### Phase 1 — Verify the scaffold
 - [ ] Create a venv, install `requirements-dev.txt`.
 - [ ] `pytest -q` passes (URL, downloader classification, messages).
-- [ ] `docker compose up --build` starts web, worker, db, redis. `curl localhost:8000/health` returns `{"status":"ok"}`.
+- [ ] `docker compose up --build` starts the bot (polling + workers) and the Mini App. `curl localhost:8000/health` returns `{"status":"ok"}`.
 - **Gate:** all three succeed. Report any failure with the exact error before changing code.
 
 ### Phase 2 — Unit tests for core logic
-- [ ] `tests/test_store.py`: rate limit (per minute and per day, using a Redis test instance or `fakeredis` added to dev deps), `claim` is one-shot, `dedupe_update`, `cancel` flag.
+- [ ] `tests/test_store.py`: rate limit (per minute and per day, against the in-memory store), `claim` is one-shot, `dedupe_update`, `cancel` flag.
 - [ ] `tests/test_handlers.py`: mock `TelegramClient` and `db`/`store` with `monkeypatch`. Cover: plain link → keyboard; unsupported host → UNSUPPORTED; `/start`, `/help`, unknown command; non-admin `/admin` gets UNKNOWN_COMMAND; banned user gets BANNED; callback from another user is ignored; duplicate tap enqueues once; cached file_id is sent without enqueueing.
-- [ ] `tests/test_webhook.py`: FastAPI `TestClient`. Wrong secret → 403. Duplicate `update_id` → processed once. Missing secret header → 403.
+- [x] `tests/test_poller.py` / `tests/test_app.py`: offset advances, duplicate `update_id` processed once, backoff on errors, end-to-end link → file with temp cleanup.
 - **Gate:** `pytest -q` green. Coverage of `handlers.py` and `main.py` ≥ 80% (`pytest --cov` with `pytest-cov` added to dev deps).
 
 ### Phase 3 — yt-dlp spike and FR-04
@@ -193,8 +188,8 @@ Each phase ends with a verification gate. Do not start the next phase until the 
 
 ### Phase 6 — Release
 - [ ] Create the Render Blueprint from `render.yaml`. Fill `sync: false` vars in the dashboard.
-- [ ] Run `PYTHONPATH=. python scripts/set_webhook.py` against the production URL.
-- [ ] Set Render alerts: web 5xx rate, worker restarts, Redis memory >80%.
+- [ ] Confirm the logs show `polling started` and no `409 conflict` (no other instance on the same token).
+- [ ] Set Render alerts: web 5xx rate, service restarts, memory >80% (state and downloads share the instance RAM).
 - [ ] Soft-launch with 20–50 users. Check `/admin stats` daily.
 - **Gate:** 48 h with error rate under 20% and no worker restarts loop.
 

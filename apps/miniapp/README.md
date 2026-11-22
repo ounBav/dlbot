@@ -50,10 +50,10 @@ docker compose up    # from the repo root: web :8000, worker, db, redis, miniapp
 
 Telegram only opens HTTPS Mini Apps. To try it in Telegram locally:
 
-1. Tunnel port 5173 (for example `ngrok http 5173`) and the webhook port.
+1. Tunnel port 5173 (for example `ngrok http 5173`) and the bot API port 8000 (the bot itself polls Telegram and needs no tunnel).
 2. Set `apiBase` in `config.js` to the **HTTPS** URL of the web service.
 3. In `apps/bot/.env`, set `MINIAPP_URL=<tunnel URL>` and add the tunnel origin to `CORS_ORIGINS`.
-4. Restart `web`. On startup it sets the chat Menu button to open the Mini App; `/start` also shows an
+4. Restart `bot`. On startup it sets the chat Menu button to open the Mini App; `/start` also shows an
    "Open app" button.
 
 ## Deploy (Render)
