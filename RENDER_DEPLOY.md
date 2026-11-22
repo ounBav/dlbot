@@ -97,6 +97,7 @@ Re-run the workflow (**Actions → deploy → Run workflow**), then send a link 
 
 | Symptom | Cause / fix |
 |---|---|
+| Render: `failed to read dockerfile: open Dockerfile: no such file or directory` | Service is still `runtime: docker` and builds `./Dockerfile` from the repo root. The Dockerfile must stay at the repo root (it builds `apps/bot/` with root context). Don't move it back into `apps/bot/` without also changing the service's Dockerfile path and context. |
 | Render: "failed to pull image" / unauthorized | Credential name isn't `ghcr-dlbot`, or the token lacks `read:packages` |
 | Actions `deploy`: HTTP 400 | Image URL in `render.yaml` doesn't match `ghcr.io/<owner>/<repo>` (must be lowercase) |
 | Actions `deploy`: HTTP 404 | Deploy hook secret is wrong or was regenerated |

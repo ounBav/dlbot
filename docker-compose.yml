@@ -17,7 +17,7 @@ services:
     ports: ["6379:6379"]
 
   web:
-    build: ./apps/bot
+    build: .   # root Dockerfile (same file Render and CI build)
     env_file: apps/bot/.env
     environment:
       DB_HOST: db
@@ -32,7 +32,7 @@ services:
     depends_on: [db, redis]
 
   worker:
-    build: ./apps/bot
+    build: .
     command: python -m app.worker
     # The image HEALTHCHECK curls /health, which only the web service serves.
     healthcheck:

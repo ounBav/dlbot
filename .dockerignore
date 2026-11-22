@@ -1,0 +1,9 @@
+# Build context = repo root (Render's default for Docker services). Whitelist only what the
+# image needs, so secrets (apps/bot/.env), the Mini App, docs and .git never reach the builder.
+*
+!apps/bot/requirements.txt
+!apps/bot/app
+!apps/bot/migrations
+!apps/bot/scripts
+**/__pycache__
+**/*.pyc

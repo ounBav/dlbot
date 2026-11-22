@@ -1,4 +1,7 @@
-# One image for both Render services (web + worker). Built once in GitHub Actions.
+# One image for both Render services (web + worker).
+# Lives at the repo root and builds with the repo root as context, because that is what Render
+# uses by default for Docker services (./Dockerfile, context .). GitHub Actions and docker compose
+# build this same file. The bot's sources are under apps/bot/; .dockerignore whitelists them.
 # Layers are ordered slowest-changing first so a code-only change rebuilds in seconds.
 
 # Static ffmpeg/ffprobe (pinned). Copying two binaries replaces a ~110 s apt-get install.
@@ -18,13 +21,13 @@ RUN useradd --create-home appuser
 WORKDIR /app
 
 # Dependencies change rarely: this layer stays cached across code-only pushes.
-COPY requirements.txt .
+COPY apps/bot/requirements.txt .
 RUN pip install -r requirements.txt
 
-# Only what the app needs at runtime. Docs/tests changes don't touch the image.
-COPY --chown=appuser:appuser app ./app
-COPY --chown=appuser:appuser migrations ./migrations
-COPY --chown=appuser:appuser scripts ./scripts
+# Only what the app needs at runtime. Docs/tests/Mini App changes don't touch the image.
+COPY --chown=appuser:appuser apps/bot/app ./app
+COPY --chown=appuser:appuser apps/bot/migrations ./migrations
+COPY --chown=appuser:appuser apps/bot/scripts ./scripts
 
 USER appuser
 EXPOSE 8000
