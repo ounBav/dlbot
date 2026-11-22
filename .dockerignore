@@ -3,7 +3,5 @@
 *
 !apps/bot/requirements.txt
 !apps/bot/app
-!apps/bot/migrations
-!apps/bot/scripts
 **/__pycache__
 **/*.pyc

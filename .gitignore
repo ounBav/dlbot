@@ -6,3 +6,4 @@ __pycache__/
 *.egg-info/
 apps/miniapp/dist/
 node_modules/
+apps/bot/tmp/

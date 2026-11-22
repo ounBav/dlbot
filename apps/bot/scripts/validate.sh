@@ -170,16 +170,10 @@ else
     fail "uvicorn not in requirements.txt"
 fi
 
-if grep -q "psycopg" requirements.txt; then
-    pass "psycopg in requirements.txt"
+if grep -qE "^(psycopg|redis)" requirements.txt; then
+    fail "psycopg/redis in requirements.txt (state is in memory; they are not used)"
 else
-    fail "psycopg not in requirements.txt"
-fi
-
-if grep -q "redis" requirements.txt; then
-    pass "redis in requirements.txt"
-else
-    fail "redis not in requirements.txt"
+    pass "no database/redis dependencies"
 fi
 
 echo ""
@@ -193,22 +187,16 @@ else
     fail "Web service not defined in render.yaml"
 fi
 
-if grep -q "type: worker" render.yaml; then
-    pass "Worker service defined"
+if grep -qE "type: worker|type: keyvalue|^databases:" render.yaml; then
+    fail "render.yaml defines a worker/Redis/Postgres (in-memory state needs one single service)"
 else
-    fail "Worker service not defined in render.yaml"
+    pass "Single service (no worker, database or Redis)"
 fi
 
-if grep -q "type: postgres\|databases:" render.yaml; then
-    pass "Database service defined"
+if grep -q "numInstances: 1" render.yaml; then
+    pass "Bot service pinned to one instance"
 else
-    fail "Database service not defined in render.yaml"
-fi
-
-if grep -q "type: keyvalue\|keyValue:" render.yaml; then
-    pass "Redis service defined"
-else
-    fail "Redis service not defined in render.yaml"
+    warn "numInstances: 1 not set (in-memory state must not scale out)"
 fi
 
 if grep -q "healthCheckPath: /health" render.yaml; then
@@ -240,7 +228,7 @@ echo ""
 echo -e "${BLUE}📚 Documentation${NC}"
 
 test -f "DEPLOY.md" && pass "DEPLOY.md present" || fail "DEPLOY.md missing"
-test -f "TROUBLESHOOTING.md" && pass "TROUBLESHOOTING.md present" || fail "TROUBLESHOOTING.md missing"
+test -f "../../docs/RENDER_DEPLOY.md" && pass "docs/RENDER_DEPLOY.md present" || fail "docs/RENDER_DEPLOY.md missing"
 test -f "IMPROVEMENTS.md" && pass "IMPROVEMENTS.md present" || fail "IMPROVEMENTS.md missing"
 test -f "README.md" && pass "README.md present" || fail "README.md missing"
 
@@ -252,7 +240,7 @@ echo -e "${BLUE}⚙️  Deployment Scripts${NC}"
 test -f "scripts/deploy.sh" && pass "scripts/deploy.sh present" || fail "scripts/deploy.sh missing"
 test -f "scripts/monitor.sh" && pass "scripts/monitor.sh present" || fail "scripts/monitor.sh missing"
 test -f "scripts/validate.sh" && pass "scripts/validate.sh present" || fail "scripts/validate.sh missing"
-test -f "scripts/set_webhook.py" && pass "scripts/set_webhook.py present" || fail "scripts/set_webhook.py missing"
+test -f "app/poller.py" && pass "app/poller.py present" || fail "app/poller.py missing"
 
 echo ""
 
