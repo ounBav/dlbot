@@ -50,6 +50,17 @@ class _TTLDict:
         self.set(key, value, ttl, now)
         return True
 
+    def add_within(self, key: str, n: int, limit: int, ttl: float, now: float) -> tuple[bool, int]:
+        """Add n to a counter only if the result stays <= limit. Returns (added, value after)."""
+        item = self.get(key, now)
+        current = item or 0
+        if current + n > limit:
+            return False, current
+        value = max(current + n, 0)
+        expires = self._data[key][0] if item is not None else now + ttl
+        self._data[key] = (expires, value)
+        return True, value
+
     def incr(self, key: str, ttl: float, now: float) -> int:
         """Increment a counter, keeping the expiry set when the counter was created."""
         if self.get(key, now) is None:
@@ -78,6 +89,7 @@ class MemoryStore:
         self._audit: list[dict] = []
         self._files: dict[str, tuple[float, dict]] = {}   # Mini App "save to device" tokens
         self._windows: dict[str, deque] = {}               # sliding-window rate limits
+        self._scans: dict[int, tuple[float, dict]] = {}    # TikTok profile listing, one per user
         self._last_sweep = 0.0
         self.worker_heartbeat = 0.0
 
@@ -88,6 +100,8 @@ class MemoryStore:
             self._kv.sweep(now)
             for key in [k for k, (exp, _) in self._progress.items() if exp <= now]:
                 del self._progress[key]
+            for uid in [k for k, (exp, _) in self._scans.items() if exp <= now]:
+                del self._scans[uid]
         return now
 
     # --- generic key/value with TTL ---
@@ -161,6 +175,39 @@ class MemoryStore:
             now = time.time()
             gone = [k for k, (exp, _) in self._files.items() if exp <= now]
             return [self._files.pop(k)[1] for k in gone]
+
+    def kv_add_within(self, key: str, n: int, limit: int, ttl: float) -> tuple[bool, int]:
+        with self._lock:
+            return self._kv.add_within(key, n, limit, ttl, self._now())
+
+    # --- TikTok profile scans (one-time: dropped on send, discard, expiry or restart) ---
+
+    def put_scan(self, user_id: int, scan: dict, ttl: float) -> float:
+        with self._lock:
+            expires = self._now() + ttl
+            self._scans[user_id] = (expires, scan)
+            return expires
+
+    def get_scan(self, user_id: int) -> dict | None:
+        with self._lock:
+            item = self._scans.get(user_id)
+            if item is None or item[0] <= self._now():
+                self._scans.pop(user_id, None)
+                return None
+            return {**item[1], "expires_at": item[0]}
+
+    def drop_scan(self, user_id: int, scan_id: str | None = None) -> bool:
+        """Forget the user's scan (only if it is `scan_id`, when given). True if one was removed."""
+        with self._lock:
+            item = self._scans.get(user_id)
+            if item is None or (scan_id is not None and item[1].get("id") != scan_id):
+                return False
+            del self._scans[user_id]
+            return True
+
+    def scan_count(self) -> int:
+        with self._lock:
+            return len(self._scans)
 
     # --- sliding-window rate limit ---
 
@@ -353,6 +400,33 @@ def rate_limit_hit(user_id: int, per_minute: int, per_day: int) -> tuple[bool, i
     if day_count > per_day:
         return False, 86400 - (now % 86400)
     return True, 0
+
+
+def reserve_daily(user_id: int, n: int, per_day: int) -> tuple[bool, int]:
+    """Count n downloads at once against today's quota, all or nothing (Mini App profile batch).
+    Returns (allowed, remaining_today). The per-minute window does not apply to a batch: its size
+    is capped by PROFILE_MAX_SEND instead."""
+    _, day_key = _keys(user_id, int(time.time()))
+    ok, used = get_store().kv_add_within(day_key, n, per_day, 90000)
+    return ok, max(per_day - used, 0)
+
+
+def release_daily(user_id: int, n: int) -> None:
+    """Give back a reservation that could not be used (e.g. the bot chat was never started)."""
+    _, day_key = _keys(user_id, int(time.time()))
+    get_store().kv_add_within(day_key, -n, 10**9, 90000)
+
+
+def put_scan(user_id: int, scan: dict, ttl: float) -> float:
+    return get_store().put_scan(user_id, scan, ttl)
+
+
+def get_scan(user_id: int) -> dict | None:
+    return get_store().get_scan(user_id)
+
+
+def drop_scan(user_id: int, scan_id: str | None = None) -> bool:
+    return get_store().drop_scan(user_id, scan_id)
 
 
 def hit_window(key: str, limit: int, window: float) -> tuple[bool, int]:

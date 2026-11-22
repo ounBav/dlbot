@@ -4,6 +4,8 @@ Shared by the chat flow (inline button callback) and the Mini App API so both be
 Chat delivery: the status message (chat_id, message_id) must already exist; the worker edits it.
 Device delivery (Mini App "Save to device"): no chat message; the worker keeps the file behind a
 short-lived link instead of uploading it to Telegram.
+Chat delivery without a status message (message_id None): Mini App TikTok profile batches, which
+post one summary message for the whole batch instead.
 """
 
 from . import messages, store
@@ -18,7 +20,7 @@ def cache_key(fmt: str, quality: int | None) -> str:
 
 def submit(tg: TelegramClient, *, token: str, user_id: int, chat_id: int | None, message_id: int | None,
            url: str, platform: str, fmt: str, source: str = "chat", quality: int | None = None,
-           delivery: str = "chat") -> str | None:
+           delivery: str = "chat", title: str | None = None) -> str | None:
     """Return the request id of the queued job, or None if it was served from cache."""
     if fmt == "audio":
         quality = None
@@ -26,12 +28,13 @@ def submit(tg: TelegramClient, *, token: str, user_id: int, chat_id: int | None,
         cached = store.cache_get(url_hash(url), cache_key(fmt, quality))
         if cached:
             tg.send_cached(chat_id, fmt, cached, messages.CACHED_CAPTION)
-            tg.edit_message(chat_id, message_id, messages.DONE)
+            if message_id is not None:
+                tg.edit_message(chat_id, message_id, messages.DONE)
             return None
 
     db_id = store.create_request(user_id, url, platform, fmt, source=source)
     store.set_progress(db_id, token=token, user_id=user_id, stage="queued", delivery=delivery,
-                       quality=quality)
+                       quality=quality, **({"title": title[:200]} if title else {}))
     job = {
         "token": token,
         "db_id": db_id,
@@ -47,8 +50,10 @@ def submit(tg: TelegramClient, *, token: str, user_id: int, chat_id: int | None,
         job["quality"] = quality
     if delivery != "chat":
         job["delivery"] = delivery
+    if title:
+        job["title"] = title[:200]   # names the video in a batch failure note (no status message)
     store.enqueue(job)
     store.set_active(user_id, token)
-    if delivery == "chat":
+    if delivery == "chat" and message_id is not None:
         tg.edit_message(chat_id, message_id, messages.QUEUED)
     return db_id

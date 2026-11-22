@@ -6,3 +6,6 @@ httpx==0.28.1
 pydantic-settings==2.16.3
 # Bump deliberately when an extractor breaks; re-run the smoke test after.
 yt-dlp==2026.10.26
+# Browser impersonation for yt-dlp. Required by the Mini App TikTok profile listing (app/profiles.py):
+# TikTok refuses the profile page without it. Same pin as yt-dlp's own "pin-curl-cffi" extra.
+curl-cffi==0.17.0

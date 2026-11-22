@@ -2,6 +2,7 @@
 
 Telegram bot: user sends a public TikTok, YouTube or Facebook link → bot offers 🎬 Video / 🎵 Audio → bot downloads with yt-dlp and sends the file back. No media is stored after delivery.
 Mini App: same pipeline, plus preview, quality pick and "Save to device": the finished file is served from `/api/files/<token>` (random 32-byte token) for `FILE_TTL_MIN` (15 min), then deleted (owner decision, 2026-11-22).
+Mini App "TikTok profile" tab: enter `@username`, list the last 10/50/100/all (cap `PROFILE_MAX_VIDEOS`) public videos with yt-dlp flat extraction (no download), pick up to `PROFILE_MAX_SEND`, and the bot sends them to the chat. The listing is one-time, in memory only: dropped on send, new search, Back, app close (`pagehide` → discard), after `PROFILE_SCAN_TTL_MIN`, or on restart (owner decision, 2026-11-22; this is the one approved exception to "no playlists/channels").
 
 This file is the source of truth for Claude Code. Read it fully before changing code.
 
@@ -59,6 +60,7 @@ queue ──get──▶ WorkerPool threads (app/worker.py, same process)
 | `app/config.py` | `Settings` (pydantic-settings), read from env / `.env` |
 | `app/log.py` | JSON logging. Pass `extra={"req_id", "user_id", "platform", "code"}`. |
 | `app/api.py` | Mini App HTTP API under `/api` (me, info preview, create/list/get/cancel downloads, `files/<token>`). Read-only on polls. |
+| `app/profiles.py` | TikTok profile listing (flat yt-dlp, `tiktok:user`): username parsing, URL built server-side (SSRF), error codes. Needs `curl-cffi`. |
 | `app/jobs.py` | `submit()`: cache hit or enqueue. Shared by chat callbacks and the Mini App API. |
 | `app/webapp_auth.py` | Validates Mini App `initData` (HMAC with the bot token, `auth_date` max age) |
 
@@ -90,6 +92,8 @@ Mini App job stages (store progress `job:<db_id>`, then the request log): `queue
 | `E-PRIVATE` | Private, members-only, age-gated, login required | no |
 | `E-TOOBIG` | Over `MAX_UPLOAD_MB` (download or Telegram 413) | no |
 | `E-FAILED` | Anything else (network, extractor break, unexpected) | yes, up to `MAX_JOB_ATTEMPTS` |
+
+Mini App profile tab only (`/api/tiktok/*`): `E-USERNAME` (bad handle), `E-PROFILE` (unknown profile or TikTok refused; retried `PROFILE_SCAN_ATTEMPTS` times), `E-NOVIDEOS`, `E-SCANGONE` (listing expired/used), `E-TOOMANY` (`max`), `E-QUOTA` (`remaining`: batch larger than today's quota left). A batch counts against the daily limit only (all or nothing, `store.reserve_daily`); the per-minute window does not apply.
 
 ## 4. Functional scope (v1)
 
@@ -126,7 +130,7 @@ Commands: `/start /help /status /cancel /terms /admin`. Plus `/language` when FR
 
 - Do not store downloaded media beyond the job. Only exception: Mini App "save to device" files, kept on the instance's temp disk for `FILE_TTL_MIN` (owner decision, 2026-11-22). No S3, no persistent volumes for media.
 - Do not add DRM, login, cookie, or proxy bypass code. If YouTube blocks datacenter IPs, the decision goes back to the owner (see Open Questions).
-- Do not add group chat support, payments, a web UI, or playlists/channels.
+- Do not add group chat support, payments, a web UI, or playlists/channels. Exception: the Mini App TikTok profile tab (owner decision, 2026-11-22, see top).
 - Do not add MQTT.
 - Do not commit `.env` or any secret. Secrets belong in Render env vars.
 - Do not change the message wording in `messages.py` without asking. Product owns the copy.

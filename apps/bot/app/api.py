@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -23,7 +24,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from . import jobs, messages, store
+from . import jobs, messages, profiles, store
 from .config import get_settings
 from .downloader import QUALITY_LADDER, DownloadError, probe
 from .tg import TelegramClient, TelegramError
@@ -171,6 +172,8 @@ def me(user: dict = Depends(current_user)):
         "terms_url": s.terms_url or None,
         "qualities": list(QUALITY_LADDER),
         "file_ttl_min": s.file_ttl_min,
+        "profile_max_videos": max(1, s.profile_max_videos),
+        "profile_max_send": _max_send(),
     }
 
 
@@ -281,6 +284,125 @@ def cancel_download(job_id: str, user: dict = Depends(current_user)):
         raise _fail(409, "E-FINISHED")
     store.mark_cancel(token)
     return {"id": job_id, "status": "cancelling"}
+
+
+# --- TikTok profile tab: list a profile once, pick videos, send them to the bot chat -------------
+# The listing is one-time state (store.put_scan, one per user): it is dropped when the videos are
+# sent, when the app closes (POST /tiktok/scan/discard), after PROFILE_SCAN_TTL_MIN, or on restart.
+
+MAX_SEND_HARD = 20   # the UI follows a batch through GET /downloads, which returns the last 20 jobs
+
+
+def _max_send() -> int:
+    return max(1, min(get_settings().profile_max_send, MAX_SEND_HARD))
+
+
+def _video_view(v: dict) -> dict:
+    return {k: v[k] for k in ("id", "url", "title", "duration", "thumbnail", "timestamp", "view_count")}
+
+
+class ScanIn(BaseModel):
+    username: str = Field(min_length=1, max_length=200)
+    limit: Literal[10, 50, 100, "all"] = 10
+
+
+@router.post("/tiktok/scan")
+def scan_profile(body: ScanIn, user: dict = Depends(current_user)):
+    """List the latest public videos of a TikTok profile (metadata only). Replaces any earlier list."""
+    username = profiles.normalize_username(body.username)
+    if username is None:
+        raise _fail(400, "E-USERNAME")
+    s = get_settings()
+    allowed, retry_after = store.hit_window(f"scan:{user['id']}", s.profile_scan_rate_per_minute, 60)
+    if not allowed:
+        raise _fail(429, "E-RATELIMIT", retry_after=retry_after)
+    store.drop_scan(user["id"])          # never keep two listings for one user
+    cap = max(1, s.profile_max_videos)
+    limit = cap if body.limit == "all" else min(body.limit, cap)
+    try:
+        result = profiles.scan(username, limit, attempts=s.profile_scan_attempts)
+    except DownloadError as exc:
+        log.info("profile scan refused", extra={"user_id": user["id"], "platform": "tiktok", "code": exc.code})
+        raise _fail(422, exc.code)
+
+    scan_id = secrets.token_urlsafe(12)
+    videos = [_video_view(asdict(v)) for v in result.videos]
+    expires = store.put_scan(user["id"], {"id": scan_id, "username": result.username, "videos": videos},
+                             s.profile_scan_ttl_min * 60)
+    log.info("profile scanned", extra={"user_id": user["id"], "platform": "tiktok", "code": f"n={len(videos)}"})
+    return {
+        "scan_id": scan_id,
+        "username": result.username,
+        "nickname": result.nickname or None,
+        "limit": body.limit,
+        "count": len(videos),
+        # "All" stopped at the server's cap: the profile may have more videos than listed.
+        "truncated": body.limit == "all" and len(videos) >= cap,
+        "max_send": _max_send(),
+        "expires_at": datetime.fromtimestamp(expires, timezone.utc),
+        "videos": videos,
+    }
+
+
+class SendIn(BaseModel):
+    video_ids: list[str] = Field(min_length=1, max_length=MAX_SEND_HARD)
+
+
+@router.post("/tiktok/scan/{scan_id}/send")
+def send_profile_videos(scan_id: str, body: SendIn, user: dict = Depends(current_user),
+                        tg: TelegramClient = Depends(get_tg)):
+    """Queue the picked videos for delivery to the bot chat, then forget the listing (one-time)."""
+    user_id = user["id"]
+    scan = store.get_scan(user_id)
+    if scan is None or scan["id"] != scan_id:
+        raise _fail(410, "E-SCANGONE")
+    by_id = {v["id"]: v for v in scan["videos"]}
+    picked = [by_id[i] for i in dict.fromkeys(body.video_ids) if i in by_id]
+    if not picked:
+        raise _fail(400, "E-NOTFOUND")
+    max_send = _max_send()
+    if len(picked) > max_send:
+        raise _fail(400, "E-TOOMANY", max=max_send)
+
+    _remember(user)
+    s = get_settings()
+    allowed, remaining = store.reserve_daily(user_id, len(picked), s.rate_per_day)
+    if not allowed:
+        if remaining <= 0:
+            now = int(datetime.now(timezone.utc).timestamp())
+            raise _fail(429, "E-RATELIMIT", retry_after=86400 - (now % 86400))
+        raise _fail(429, "E-QUOTA", remaining=remaining)
+
+    try:   # one summary message per batch; it also proves the user has started the bot
+        tg.send_message(user_id, messages.from_profile(len(picked), scan["username"]))
+    except TelegramError:
+        store.release_daily(user_id, len(picked))
+        raise _fail(409, "E-NOCHAT")
+
+    items = []
+    for video in picked:
+        item = {"video_id": video["id"], "id": None, "status": "queued"}
+        try:
+            db_id = jobs.submit(tg, token=secrets.token_urlsafe(8), user_id=user_id, chat_id=user_id,
+                                message_id=None, url=video["url"], platform="tiktok", fmt="video",
+                                source="profile", delivery="chat", title=video["title"] or None)
+            item.update(id=db_id, status="queued" if db_id else "done")
+        except TelegramError:
+            log.warning("profile batch item failed", extra={"user_id": user_id, "platform": "tiktok"})
+            item["status"] = "failed"
+        items.append(item)
+
+    store.drop_scan(user_id, scan_id)   # one-time listing: gone once the videos are on their way
+    log.info("profile batch queued", extra={"user_id": user_id, "platform": "tiktok",
+                                            "code": f"n={len(items)}"})
+    return {"username": scan["username"], "items": items,
+            "queued": sum(i["status"] == "queued" for i in items)}
+
+
+@router.post("/tiktok/scan/discard")
+def discard_scan(user: dict = Depends(current_user)):
+    """The app is closing or starting over: forget the listing now instead of waiting for the TTL."""
+    return {"discarded": store.drop_scan(user["id"])}
 
 
 @files_router.api_route("/files/{token}", methods=["GET", "HEAD"])
