@@ -1,6 +1,7 @@
 # CLAUDE.md — Media Downloader Bot (v1 / MVP)
 
 Telegram bot: user sends a public TikTok, YouTube or Facebook link → bot offers 🎬 Video / 🎵 Audio → bot downloads with yt-dlp and sends the file back. No media is stored after delivery.
+Mini App: same pipeline, plus preview, quality pick and "Save to device": the finished file is served from `/api/files/<token>` (random 32-byte token) for `FILE_TTL_MIN` (15 min), then deleted (owner decision, 2026-11-22).
 
 This file is the source of truth for Claude Code. Read it fully before changing code.
 
@@ -57,7 +58,7 @@ queue ──get──▶ WorkerPool threads (app/worker.py, same process)
 | `app/url_utils.py` | URL extraction, host allow-list, `url_hash` |
 | `app/config.py` | `Settings` (pydantic-settings), read from env / `.env` |
 | `app/log.py` | JSON logging. Pass `extra={"req_id", "user_id", "platform", "code"}`. |
-| `app/api.py` | Mini App HTTP API under `/api` (me, create/list/get/cancel downloads). Read-only on polls. |
+| `app/api.py` | Mini App HTTP API under `/api` (me, info preview, create/list/get/cancel downloads, `files/<token>`). Read-only on polls. |
 | `app/jobs.py` | `submit()`: cache hit or enqueue. Shared by chat callbacks and the Mini App API. |
 | `app/webapp_auth.py` | Validates Mini App `initData` (HMAC with the bot token, `auth_date` max age) |
 
@@ -68,7 +69,7 @@ Paths above are relative to `apps/bot/`. The repo is a monorepo:
 | `apps/bot/` | Python bot: long polling + in-process workers (one Docker image, one process) |
 | `apps/miniapp/` | Telegram Mini App: static HTML/CSS/ES modules, no build, no deps. See its README. Copy lives in `src/strings.js`. Tests: `npm test` (Node 20+). Hosted as the Render static site `bot-miniapp`. |
 
-Mini App job stages (store progress `job:<db_id>`, then the request log): `queued → downloading → (retrying) → uploading → done | failed | cancelled`. The API reports `expired` when a job is not final, its progress hash is gone, and it is older than `REQUEST_TTL`.
+Mini App job stages (store progress `job:<db_id>`, then the request log): `queued → downloading → (retrying) → (processing) → uploading → done | failed | cancelled` (device delivery skips `uploading`; `done` then carries the file link while it is valid). The API reports `expired` when a job is not final, its progress hash is gone, and it is older than `REQUEST_TTL`.
 
 ### Callback protocol
 
@@ -117,13 +118,13 @@ Commands: `/start /help /status /cancel /terms /admin`. Plus `/language` when FR
 - **NFR-03** failed jobs retry with backoff; updates are idempotent (`dedupe_update`).
 - **NFR-05** verify `X-Telegram-Bot-Api-Secret-Token` with `hmac.compare_digest`. Never log the bot token.
 - **NFR-06** only allow-listed hosts reach yt-dlp. No shell. SSRF: never fetch a URL that isn't on the allow-list.
-- **NFR-07** temp media is deleted in `finally`; leftover `job-*` folders are removed on startup. The request log is in memory only (bounded).
+- **NFR-07** temp media is deleted in `finally`; leftover `job-*` folders are removed on startup. Mini App "save to device" folders are kept until their link expires (`FILE_TTL_MIN`), then the janitor thread deletes them. The request log is in memory only (bounded).
 - **NFR-08** JSON logs; alert when error rate >20% over 15 min (configure in Render, Phase 6).
 - **NFR-09** yt-dlp pinned to an exact version. Weekly smoke-test job (Phase 5).
 
 ## 6. Boundaries (do NOT do without asking)
 
-- Do not store downloaded media beyond the job. No S3, no persistent volumes for media.
+- Do not store downloaded media beyond the job. Only exception: Mini App "save to device" files, kept on the instance's temp disk for `FILE_TTL_MIN` (owner decision, 2026-11-22). No S3, no persistent volumes for media.
 - Do not add DRM, login, cookie, or proxy bypass code. If YouTube blocks datacenter IPs, the decision goes back to the owner (see Open Questions).
 - Do not add group chat support, payments, a web UI, or playlists/channels.
 - Do not add MQTT.
