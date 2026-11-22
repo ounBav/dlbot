@@ -222,3 +222,57 @@ def test_mini_app_save_to_device_end_to_end(bot, monkeypatch):
     assert worker.sweep_files() == 1
     assert wait_for(lambda: os.listdir(tmp_path) == [])
     assert client.get(f"/api/downloads/{job_id}", headers=auth).json()["file"] is None
+
+
+HEALTH_KEYS = {"ok", "uptime_sec", "polling", "last_update_at"}
+
+
+def test_health_get_and_head_return_200_with_expected_keys(bot):
+    client, tg, _ = bot
+    body = client.get("/health").json()
+    assert HEALTH_KEYS <= body.keys()
+    assert body["ok"] is True and body["polling"] is True and isinstance(body["uptime_sec"], int)
+    assert body["last_update_at"] is None          # no update received yet
+    assert client.head("/health").status_code == 200
+
+    tg.push(text(1, "/help"))
+    assert wait_for(lambda: client.get("/health").json()["last_update_at"] is not None)
+    assert "T" in client.get("/health").json()["last_update_at"]   # ISO 8601
+
+
+def test_health_is_200_with_polling_false_when_poller_is_dead(monkeypatch, caplog):
+    dead = SimpleNamespace(alive=lambda: False, last_update_at=None)
+    monkeypatch.setattr(main, "poller", dead)
+    client = TestClient(main.app)                  # no `with`: lifespan does not start a real poller
+    with caplog.at_level("WARNING", logger="bot"):
+        r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True and r.json()["polling"] is False and r.json()["status"] == "degraded"
+    assert "polling is not running" in caplog.text
+    assert client.head("/health").status_code == 200
+
+
+def test_self_ping_gets_health_until_cancelled():
+    import asyncio
+
+    import httpx
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, str(request.url)))
+        return httpx.Response(200, json={"ok": True})
+
+    async def scenario():
+        task = asyncio.create_task(main._self_ping("https://bot.example/health", 0.01,
+                                                   transport=httpx.MockTransport(handler)))
+        while len(seen) < 2:
+            await asyncio.sleep(0.01)
+        task.cancel()
+
+    asyncio.run(scenario())
+    assert seen[0] == ("GET", "https://bot.example/health")
+
+
+def test_self_ping_is_off_by_default():
+    assert Settings(_env_file=None, bot_token="1:x").keepalive_self_ping is False

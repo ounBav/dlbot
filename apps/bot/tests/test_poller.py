@@ -149,3 +149,55 @@ def test_client_get_updates_sends_offset_and_long_timeout():
     assert tg.get_updates(42, 25, ["message"]) == [{"update_id": 1}]
     assert captured["body"] == {"timeout": 25, "allowed_updates": ["message"], "offset": 42}
     assert captured["timeout"] > 25  # HTTP read timeout outlasts the long poll
+
+
+def test_delete_webhook_keeps_pending_updates():
+    # Commands sent while the service restarts must still be answered (Telegram keeps them 24 h).
+    captured = {}
+
+    def handler(request):
+        import json
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    tg = TelegramClient("1:x")
+    tg.http = httpx.Client(transport=httpx.MockTransport(handler))
+    tg.delete_webhook()
+    assert captured["body"].get("drop_pending_updates") is False
+
+
+def test_no_code_drops_pending_updates():
+    import pathlib
+    src = pathlib.Path(poller_mod.__file__).parent
+    for f in src.glob("*.py"):
+        assert "drop_pending_updates=True" not in f.read_text(encoding="utf-8"), f.name
+
+
+def test_crashed_loop_restarts_with_backoff(monkeypatch):
+    p = Poller(ScriptedTg())
+    runs, waits = [], []
+
+    def flaky_run():
+        runs.append(1)
+        if len(runs) <= 5:
+            raise RuntimeError("boom")
+        p._stop.set()               # sixth run: behave, then stop
+
+    def fake_wait(delay):
+        assert p._crashed           # /health reports polling: false while waiting to restart
+        waits.append(delay)
+
+    monkeypatch.setattr(p, "run", flaky_run)
+    monkeypatch.setattr(p._stop, "wait", fake_wait)
+    p._supervise()
+    assert len(runs) == 6 and p.restarts == 5
+    assert waits == [5.0, 10.0, 30.0, 60.0, 60.0]
+
+
+def test_last_update_at_is_set_only_when_updates_arrive(handled):
+    tg = ScriptedTg([], [{"update_id": 1}])
+    p = Poller(tg)
+    p.poll_once()
+    assert p.last_update_at is None
+    p.poll_once()
+    assert p.last_update_at is not None

@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     bot_token: str
     # Telegram long polling: seconds Telegram holds each getUpdates call open (0 = short polling).
     poll_timeout: int = 25
+    # Optional self-ping of RENDER_EXTERNAL_URL/health (Render sets that var). Off by default: it
+    # only keeps an instance awake that is already awake; an external pinger is still needed.
+    keepalive_self_ping: bool = False
+    keepalive_interval_sec: int = 600
+    render_external_url: str = ""
     admin_ids: str = ""
     terms_url: str = ""
 
