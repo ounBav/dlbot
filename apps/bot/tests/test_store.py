@@ -123,3 +123,25 @@ def test_file_id_cache():
     store.cache_set("h", "video", "FID")
     assert store.cache_get("h", "video") == "FID"
     assert store.cache_get("h", "audio") is None
+
+
+def test_file_tokens_expire_and_are_returned_for_cleanup():
+    store.put_file("live", {"dir": "/a"}, 60)
+    store.put_file("dead", {"dir": "/b"}, -1)
+    assert store.get_file("live")["dir"] == "/a" and store.get_file("live")["expires_at"] > 0
+    assert store.get_file("dead") is None and store.get_file("nope") is None
+    assert store.pop_expired_files() == [{"dir": "/b"}]
+    assert store.pop_expired_files() == []
+
+
+def test_sliding_window_limit(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(store.time, "time", lambda: now[0])
+    assert all(store.hit_window("k", 3, 60)[0] for _ in range(3))
+    allowed, retry = store.hit_window("k", 3, 60)
+    assert not allowed and retry == 60
+    now[0] += 30
+    assert store.hit_window("k", 3, 60) == (False, 30)
+    assert store.hit_window("other", 3, 60)[0]          # per key
+    now[0] += 31
+    assert store.hit_window("k", 3, 60)[0]              # window slid past the first hits

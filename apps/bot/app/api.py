@@ -1,22 +1,31 @@
 """HTTP API for the Telegram Mini App (apps/miniapp). Mounted under /api by app/main.py.
 
 Every call carries `Authorization: tma <initData>`; the user id comes only from validated initData.
-Downloads reuse the chat pipeline: the bot posts a status message in the user's private chat,
-the worker edits it and sends the file there. The API only reports progress; it never serves media.
+Downloads reuse the chat pipeline. Two deliveries:
+  - chat:   the bot posts a status message in the user's private chat, the worker edits it and
+            sends the file there (same as the chat flow).
+  - device: no chat message; the worker keeps the finished file for FILE_TTL_MIN behind
+            GET /api/files/{token} (random 32-byte token, no initData: Telegram's downloadFile
+            fetches the URL without custom headers). The janitor deletes it afterwards.
 Errors are `{"detail": {"code": "E-...", ...}}`.
 """
 
 import logging
+import mimetypes
+import os
+import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from . import jobs, messages, store
 from .config import get_settings
+from .downloader import QUALITY_LADDER, DownloadError, probe
 from .tg import TelegramClient, TelegramError
 from .url_utils import PLATFORM_HOSTS, PLATFORM_LABELS, detect_platform, extract_url
 from .webapp_auth import InitDataError, validate
@@ -30,6 +39,9 @@ def _no_store(response: Response) -> None:
 
 
 router = APIRouter(prefix="/api", dependencies=[Depends(_no_store)])
+# Served without initData (see module docstring), so it lives on its own router.
+files_router = APIRouter(prefix="/api")
+_FILE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{43}$")   # secrets.token_urlsafe(32)
 
 # "expired": the request never reached a final state and its live progress is gone
 # (worker lost the job, or it sat in the queue past REQUEST_TTL). Shown as final so the UI stops polling.
@@ -82,19 +94,37 @@ def _is_stale(created_at) -> bool:
     return datetime.now(timezone.utc) - created_at > STALE_AFTER
 
 
+def _num(value, cast=float):
+    try:
+        return cast(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _file_view(progress: dict) -> dict | None:
+    """The download link of a finished "save to device" job, while it has not expired."""
+    token = progress.get("file_token")
+    meta = store.get_file(token) if token else None
+    if meta is None:
+        return None
+    return {"name": meta["name"], "size": meta["size"], "download_path": f"/api/files/{token}",
+            "expires_at": datetime.fromtimestamp(meta["expires_at"], timezone.utc)}
+
+
 def _job_view(row: dict) -> dict:
     """Request log row + live stage while the job is still running."""
     status = row["status"]
     title = row.get("title")
+    progress = store.get_progress(row["id"])
     if status not in FINAL_STAGES:
-        progress = store.get_progress(row["id"])
         if progress is None and _is_stale(row.get("created_at")):
             status = "expired"
         else:
-            progress = progress or {}
-            status = progress.get("stage") or "queued"
-            title = title or progress.get("title") or None
-    return {
+            status = (progress or {}).get("stage") or "queued"
+            title = title or (progress or {}).get("title") or None
+    progress = progress or {}
+    delivery = progress.get("delivery") or "chat"
+    view = {
         "id": row["id"],
         "url": row["url"],
         "platform": row["platform"],
@@ -103,7 +133,14 @@ def _job_view(row: dict) -> dict:
         "error_code": row.get("error_code"),
         "title": title,
         "created_at": row["created_at"],
+        "delivery": delivery,
+        "quality": _num(progress.get("quality"), int),
+        "progress": 1.0 if status == "done" else _num(progress.get("progress")),
+        "file": None,
     }
+    if status == "done" and delivery == "device":
+        view["file"] = _file_view(progress)
+    return view
 
 
 def _owned_request(job_id: str, user_id: int) -> dict:
@@ -132,38 +169,91 @@ def me(user: dict = Depends(current_user)):
         "platforms": [{"key": k, "label": v, "hosts": sorted(PLATFORM_HOSTS[k])}
                       for k, v in PLATFORM_LABELS.items()],
         "terms_url": s.terms_url or None,
+        "qualities": list(QUALITY_LADDER),
+        "file_ttl_min": s.file_ttl_min,
+    }
+
+
+def _allowed_url(raw: str) -> tuple[str, str]:
+    url = extract_url(raw)
+    platform = detect_platform(url) if url else None
+    if platform is None:
+        raise _fail(400, "E-UNSUPPORTED")
+    return url, platform
+
+
+class InfoIn(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+
+
+@router.post("/info")
+def media_info(body: InfoIn, user: dict = Depends(current_user)):
+    """Preview a link (title, thumbnail, qualities) without downloading. Runs yt-dlp metadata only."""
+    url, platform = _allowed_url(body.url)
+    s = get_settings()
+    allowed, retry_after = store.hit_window(f"info:{user['id']}", s.info_rate_per_minute, 60)
+    if not allowed:
+        raise _fail(429, "E-RATELIMIT", retry_after=retry_after)
+    try:
+        info = probe(url, max_duration=s.max_duration_sec)
+    except DownloadError as exc:
+        log.info("preview refused", extra={"user_id": user["id"], "platform": platform, "code": exc.code})
+        raise _fail(422, exc.code, max_duration=s.max_duration_sec or None)
+    return {
+        "url": url,
+        "platform": platform,
+        "title": info.title,
+        "uploader": info.uploader,
+        "duration": info.duration,
+        "thumbnail": info.thumbnail,
+        "has_video": info.has_video,
+        "qualities": info.qualities,
     }
 
 
 class DownloadIn(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     format: Literal["video", "audio"]
+    quality: Literal[360, 480, 720, 1080] | None = None
+    delivery: Literal["chat", "device"] = "chat"
+
+
+def _active_job(user_id: int) -> dict | None:
+    for row in store.recent_requests(user_id, limit=5):
+        view = _job_view(row)
+        if view["status"] not in FINAL_STAGES:
+            return view
+    return None
 
 
 @router.post("/downloads")
 def create_download(body: DownloadIn, user: dict = Depends(current_user), tg: TelegramClient = Depends(get_tg)):
     user_id = user["id"]
-    url = extract_url(body.url)
-    platform = detect_platform(url) if url else None
-    if platform is None:
-        raise _fail(400, "E-UNSUPPORTED")
+    url, platform = _allowed_url(body.url)
 
     _remember(user)
+    active = _active_job(user_id)
+    if active is not None:    # one active job per user; checked before the quota is spent
+        raise _fail(409, "E-BUSY", id=active["id"])
     s = get_settings()
     allowed, retry_after = store.rate_limit_hit(user_id, s.rate_per_minute, s.rate_per_day)
     if not allowed:
         raise _fail(429, "E-RATELIMIT", retry_after=retry_after)
 
-    # The private chat id equals the user id. This fails if the user never started the bot.
-    try:
-        msg = tg.send_message(user_id, messages.from_miniapp(PLATFORM_LABELS[platform], body.format))
-    except TelegramError:
-        raise _fail(409, "E-NOCHAT")
+    quality = None if body.format == "audio" else body.quality
+    chat_id = message_id = None
+    if body.delivery == "chat":
+        # The private chat id equals the user id. This fails if the user never started the bot.
+        try:
+            msg = tg.send_message(user_id, messages.from_miniapp(PLATFORM_LABELS[platform], body.format))
+        except TelegramError:
+            raise _fail(409, "E-NOCHAT")
+        chat_id, message_id = user_id, msg["message_id"]
 
     try:
-        db_id = jobs.submit(tg, token=secrets.token_urlsafe(8), user_id=user_id, chat_id=user_id,
-                            message_id=msg["message_id"], url=url, platform=platform,
-                            fmt=body.format, source="miniapp")
+        db_id = jobs.submit(tg, token=secrets.token_urlsafe(8), user_id=user_id, chat_id=chat_id,
+                            message_id=message_id, url=url, platform=platform,
+                            fmt=body.format, source="miniapp", quality=quality, delivery=body.delivery)
     except TelegramError:
         log.exception("mini app submit failed", extra={"user_id": user_id, "platform": platform})
         raise _fail(502, "E-FAILED")
@@ -191,3 +281,16 @@ def cancel_download(job_id: str, user: dict = Depends(current_user)):
         raise _fail(409, "E-FINISHED")
     store.mark_cancel(token)
     return {"id": job_id, "status": "cancelling"}
+
+
+@files_router.api_route("/files/{token}", methods=["GET", "HEAD"])
+def get_file(token: str):
+    """Stream a finished "save to device" file. 410 once the link expired (FILE_TTL_MIN)."""
+    meta = store.get_file(token) if _FILE_TOKEN.match(token) else None
+    if meta is None or not os.path.isfile(meta["path"]):
+        raise _fail(410, "E-GONE")
+    media_type = mimetypes.guess_type(meta["name"])[0] or "application/octet-stream"
+    # filename* (RFC 5987) is added by Starlette for non-ASCII titles.
+    return FileResponse(meta["path"], media_type=media_type, filename=meta["name"],
+                        content_disposition_type="attachment",
+                        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})

@@ -10,7 +10,8 @@ from app.downloader import DownloadError, DownloadResult
 def run(monkeypatch, tmp_path):
     stages: list[dict] = []
     finished: list[tuple] = []
-    settings = SimpleNamespace(temp_dir=str(tmp_path), max_upload_mb=50, max_job_attempts=1)
+    settings = SimpleNamespace(temp_dir=str(tmp_path), max_upload_mb=50, max_job_attempts=1,
+                               max_duration_sec=0, file_ttl_min=15)
     monkeypatch.setattr(worker, "get_settings", lambda: settings)
     monkeypatch.setattr(store, "set_progress", lambda rid, **f: stages.append(f))
     monkeypatch.setattr(store, "is_cancelled", lambda token: False)
@@ -33,14 +34,14 @@ def test_progress_stages_for_a_successful_job(run, tmp_path):
     path = tmp_path / "f.mp4"
     path.write_bytes(b"x")
     result = DownloadResult(path=str(path), title="Clip", duration=3, size=1)
-    names, stages, finished = run(lambda *a: result)
+    names, stages, finished = run(lambda *a, **k: result)
     assert names == ["downloading", "uploading", "done"]
     assert stages[1]["title"] == "Clip"
     assert finished == [("done", {"file_size": 1, "title": "Clip", "duration_ms": finished[0][1]["duration_ms"]})]
 
 
 def test_progress_records_the_failure_code(run):
-    def boom(*a):
+    def boom(*a, **k):
         raise DownloadError("E-PRIVATE", "login required")
     names, stages, _ = run(boom)
     assert names == ["downloading", "failed"]
@@ -53,5 +54,5 @@ def test_progress_store_outage_does_not_break_the_job(run, monkeypatch, tmp_path
     monkeypatch.setattr(store, "set_progress", down)
     path = tmp_path / "f.mp4"
     path.write_bytes(b"x")
-    _, _, finished = run(lambda *a: DownloadResult(path=str(path), title="Clip", duration=3, size=1))
+    _, _, finished = run(lambda *a, **k: DownloadResult(path=str(path), title="Clip", duration=3, size=1))
     assert finished[0][0] == "done"

@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     miniapp_url: str = ""
     miniapp_auth_max_age: int = 86400       # reject initData older than this (seconds)
     cors_origins: str = ""                   # extra comma-separated origins, e.g. local Vite dev
+    # "Save to device": finished files are kept under an unguessable link for this long, then deleted.
+    file_ttl_min: int = 15
+    # Preview (/api/info) limit per user, sliding window of 60 s. Downloads use RATE_PER_MINUTE/DAY.
+    info_rate_per_minute: int = 20
+    # Longest video accepted, in seconds. 0 = no limit (open question Q4 in CLAUDE.md).
+    max_duration_sec: int = 0
 
     @property
     def admin_id_set(self) -> set[int]:

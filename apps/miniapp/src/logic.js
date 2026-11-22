@@ -85,3 +85,67 @@ export function mergeItems(serverItems, cancelling) {
     cancelling.has(item.id) && !isFinal(item.status) ? { ...item, status: "cancelling" } : item,
   );
 }
+
+// ---------------------------------------------------------------- preview / save-to-device flow
+
+/** Default quality chip: the highest at or below 720p, else the lowest offered. */
+export function defaultQuality(qualities) {
+  const list = [...(qualities || [])].sort((a, b) => a - b);
+  if (!list.length) return null;
+  const upTo720 = list.filter((q) => q <= 720);
+  return upTo720.length ? upTo720[upTo720.length - 1] : list[0];
+}
+
+/** Next quality below `current` (for "file too large"), or null. */
+export function lowerQuality(qualities, current) {
+  const below = (qualities || []).filter((q) => q < current).sort((a, b) => b - a);
+  return below.length ? below[0] : null;
+}
+
+export function formatDuration(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
+}
+
+export function formatBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+/** 0-1 fraction (or null) -> whole percent 0-100 (or null). */
+export function percent(fraction) {
+  if (fraction == null || Number.isNaN(Number(fraction))) return null;
+  return Math.max(0, Math.min(100, Math.floor(Number(fraction) * 100)));
+}
+
+/** Back-off after consecutive network failures while polling: 1.5 s, 3 s, 6 s, 12 s (cap). */
+export function retryDelay(failures) {
+  return Math.min(1500 * 2 ** Math.max(0, failures), 12_000);
+}
+
+/** Absolute URL for a server path like /api/files/<token>. `base` is config.js apiBase. */
+export function absoluteUrl(base, path, origin = "") {
+  const root = (base || origin || "").replace(/\/+$/, "");
+  return `${root}${path.startsWith("/") ? "" : "/"}${path}`;
+}
+
+/** Which screen a polled job belongs on. */
+export function screenFor(job) {
+  if (!job) return "home";
+  if (job.status === "done") return "ready";
+  if (job.status === "cancelled") return "home";
+  if (job.status === "failed" || job.status === "expired") return "error";
+  return "progress";
+}
+
+/** Error code shown for a finished job (expired jobs and expired links get their own). */
+export function jobErrorCode(job) {
+  if (job.status === "expired") return "E-EXPIRED";
+  if (job.status === "done" && job.delivery === "device" && !job.file) return "E-GONE";
+  return job.error_code || "E-FAILED";
+}

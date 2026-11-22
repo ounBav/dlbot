@@ -46,6 +46,14 @@ services:
         value: "3"
       - key: TEMP_DIR
         value: tmp
+      # Mini App "Save to device": file links expire (and files are deleted) after this many minutes.
+      - key: FILE_TTL_MIN
+        value: "15"
+      - key: INFO_RATE_PER_MINUTE
+        value: "20"
+      # 0 = no length limit (CLAUDE.md open question Q4).
+      - key: MAX_DURATION_SEC
+        value: "0"
 
   # Telegram Mini App: static files from apps/miniapp, no dependencies. Render builds it (a copy
   # plus one generated config.js) and redeploys only when apps/miniapp changes.
@@ -55,7 +63,7 @@ services:
     rootDir: apps/miniapp
     buildCommand: >-
       rm -rf dist && mkdir dist && cp -r index.html styles.css src dist/ &&
-      printf 'window.MINIAPP_CONFIG = { apiBase: "%s" };\n' "${API_BASE_URL%/}" > dist/config.js
+      printf 'window.MINIAPP_CONFIG = { apiBase: "%s", botUsername: "%s" };\n' "${API_BASE_URL%/}" "${BOT_USERNAME}" > dist/config.js
     staticPublishPath: dist
     buildFilter:
       paths: ["apps/miniapp/**"]
@@ -75,4 +83,7 @@ services:
     envVars:
       # Public URL of bot-webhook, e.g. https://bot-webhook.onrender.com .
       - key: API_BASE_URL
+        sync: false
+      # Bot username without @ (optional): "Open in Telegram" button when the page is opened in a browser.
+      - key: BOT_USERNAME
         sync: false

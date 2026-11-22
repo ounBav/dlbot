@@ -10,6 +10,7 @@ because each process would otherwise get its own copy of this state.
 
 import queue
 import threading
+from collections import deque
 import time
 import uuid
 from collections import OrderedDict
@@ -75,6 +76,8 @@ class MemoryStore:
         self._users: dict[int, dict] = {}
         self._requests: OrderedDict[str, dict] = OrderedDict()
         self._audit: list[dict] = []
+        self._files: dict[str, tuple[float, dict]] = {}   # Mini App "save to device" tokens
+        self._windows: dict[str, deque] = {}               # sliding-window rate limits
         self._last_sweep = 0.0
         self.worker_heartbeat = 0.0
 
@@ -136,6 +139,44 @@ class MemoryStore:
             if item is None or item[0] <= self._now():
                 return None
             return dict(item[1])
+
+    # --- Mini App downloadable files (token -> file metadata) ---
+
+    def put_file(self, token: str, meta: dict, ttl: float) -> float:
+        with self._lock:
+            expires = self._now() + ttl
+            self._files[token] = (expires, dict(meta))
+            return expires
+
+    def get_file(self, token: str) -> dict | None:
+        with self._lock:
+            item = self._files.get(token)
+            if item is None or item[0] <= self._now():
+                return None
+            return {**item[1], "expires_at": item[0]}
+
+    def pop_expired_files(self) -> list[dict]:
+        """Forget expired file tokens and return their metadata so the caller deletes the files."""
+        with self._lock:
+            now = time.time()
+            gone = [k for k, (exp, _) in self._files.items() if exp <= now]
+            return [self._files.pop(k)[1] for k in gone]
+
+    # --- sliding-window rate limit ---
+
+    def hit_window(self, key: str, limit: int, window: float) -> tuple[bool, int]:
+        with self._lock:
+            now = time.time()
+            hits = self._windows.setdefault(key, deque())
+            while hits and hits[0] <= now - window:
+                hits.popleft()
+            if len(hits) >= limit:
+                return False, max(1, int(hits[0] + window - now + 0.999))
+            hits.append(now)
+            if len(self._windows) > 10_000:   # bound memory: drop idle keys
+                for k in [k for k, v in self._windows.items() if not v or v[-1] <= now - window]:
+                    del self._windows[k]
+            return True, 0
 
     # --- users ---
 
@@ -312,6 +353,24 @@ def rate_limit_hit(user_id: int, per_minute: int, per_day: int) -> tuple[bool, i
     if day_count > per_day:
         return False, 86400 - (now % 86400)
     return True, 0
+
+
+def hit_window(key: str, limit: int, window: float) -> tuple[bool, int]:
+    """Sliding-window limiter (Mini App preview). Returns (allowed, retry_after_seconds)."""
+    return get_store().hit_window(key, limit, window)
+
+
+def put_file(token: str, meta: dict, ttl: float) -> float:
+    """Register a finished Mini App file under an unguessable token. Returns the expiry (epoch s)."""
+    return get_store().put_file(token, meta, ttl)
+
+
+def get_file(token: str) -> dict | None:
+    return get_store().get_file(token)
+
+
+def pop_expired_files() -> list[dict]:
+    return get_store().pop_expired_files()
 
 
 def usage_today(user_id: int) -> int:

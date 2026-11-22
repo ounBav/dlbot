@@ -8,10 +8,12 @@ State lives in app/store.py (in memory), so this must run as exactly one process
 """
 
 import logging
+import shutil
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from yt_dlp.version import __version__ as yt_dlp_version
 
 from . import api, messages, store
 from .config import get_settings
@@ -63,6 +65,7 @@ app.add_middleware(
     max_age=600,
 )
 app.include_router(api.router)
+app.include_router(api.files_router)   # Mini App "save to device" links (token, no initData)
 
 
 @app.get("/health")
@@ -72,4 +75,5 @@ def health():
     if poller is not None and not poller.alive():
         raise HTTPException(status_code=503, detail="poller stopped")
     return {"status": "ok", "queued": store.get_store().queue_size(),
-            "polling": poller is not None and poller.last_ok is not None}
+            "polling": poller is not None and poller.last_ok is not None,
+            "ffmpeg": shutil.which("ffmpeg") is not None, "yt_dlp": yt_dlp_version}

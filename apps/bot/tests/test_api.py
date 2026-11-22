@@ -35,6 +35,7 @@ class FakeTg:
 
 @pytest.fixture
 def env(monkeypatch):
+    store.reset()   # file tokens and the preview limiter use the real in-memory store
     settings = Settings(_env_file=None, bot_token=TOKEN, rate_per_minute=5, rate_per_day=30,
                         miniapp_url="", cors_origins="")
     monkeypatch.setattr(api, "get_settings", lambda: settings)
@@ -73,6 +74,7 @@ def env(monkeypatch):
     tg = FakeTg()
     app = FastAPI()
     app.include_router(api.router)
+    app.include_router(api.files_router)
     app.dependency_overrides[api.get_tg] = lambda: tg
     client = TestClient(app)
     client.headers["Authorization"] = f"tma {make_init_data(auth_date=int(time.time()), user={'id': USER_ID, 'first_name': 'Ann'})}"

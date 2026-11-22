@@ -6,15 +6,17 @@
   <meta name="color-scheme" content="light dark">
   <meta name="referrer" content="no-referrer">
   <!-- connect-src is https: (plus localhost for dev) because the API origin comes from config.js at runtime.
+       img-src https: is for preview thumbnails (YouTube/TikTok/Facebook CDNs; loaded with no referrer).
        style-src allows inline styles because telegram-web-app.js may inject its own. -->
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https: http://localhost:8000 http://127.0.0.1:8000; base-uri 'none'; form-action 'none'; object-src 'none'">
+        content="default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https: http://localhost:8000 http://127.0.0.1:8000; base-uri 'none'; form-action 'none'; object-src 'none'">
   <title>Media Downloader</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%232481cc' d='M12 3v10.6l3.3-3.3 1.4 1.4L12 16.4l-4.7-4.7 1.4-1.4 3.3 3.3V3zM5 19h14v2H5z'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="styles.css">
+  <!-- ?v= busts Telegram's webview cache after a deploy; bump together with the imports in src/app.js. -->
+  <link rel="stylesheet" href="styles.css?v=2">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="config.js"></script>
-  <script type="module" src="src/app.js"></script>
+  <script src="config.js?v=2"></script>
+  <script type="module" src="src/app.js?v=2"></script>
 </head>
 <body>
   <!-- Full-screen states: loading, opened outside Telegram, expired session, banned. -->
@@ -26,75 +28,139 @@
   </div>
 
   <main id="app" class="app" hidden>
-    <header class="top">
-      <div class="top-text">
-        <p class="eyebrow" data-s="appTitle"></p>
-        <h1 class="greeting" id="greeting"></h1>
-      </div>
-      <div class="usage" id="usage" hidden>
-        <span class="usage-text" id="usage-text"></span>
-        <span class="meter" aria-hidden="true"><span class="meter-fill" id="usage-bar"></span></span>
-      </div>
-    </header>
+    <!-- 1. Home / paste -->
+    <section class="screen" id="screen-home" aria-labelledby="home-title">
+      <header class="top">
+        <div class="top-text">
+          <p class="eyebrow" id="greeting"></p>
+          <h1 class="title" id="home-title" data-s="appTitle"></h1>
+          <p class="lede" data-s="tagline"></p>
+        </div>
+        <div class="usage" id="usage" hidden>
+          <span class="usage-text" id="usage-text"></span>
+          <span class="meter" aria-hidden="true"><span class="meter-fill" id="usage-bar"></span></span>
+        </div>
+      </header>
 
-    <section class="card" aria-labelledby="link-label">
-      <form id="form" novalidate>
-        <label class="label" id="link-label" for="link" data-s="linkLabel"></label>
+      <form class="card" id="form" novalidate>
+        <label class="label" for="link" data-s="linkLabel"></label>
         <div class="field" id="field">
+          <span class="field-badge" id="field-badge" aria-hidden="true" hidden></span>
           <input id="link" name="link" type="url" inputmode="url" autocomplete="off" autocapitalize="off"
                  autocorrect="off" spellcheck="false" enterkeyhint="go" maxlength="2048"
                  data-s-placeholder="linkPlaceholder" aria-describedby="link-hint">
-          <button type="button" class="field-btn" id="paste" data-s="paste" hidden></button>
+          <button type="button" class="chip" id="paste" data-s="paste" hidden></button>
           <button type="button" class="field-btn icon" id="clear" data-s-aria="clear" hidden>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6L19 6.4 17.6 5 12 10.6z"/></svg>
           </button>
         </div>
         <p class="hint" id="link-hint" aria-live="polite"></p>
-
-        <fieldset class="formats">
-          <legend class="label" data-s="formatLabel"></legend>
-          <label class="format">
-            <input type="radio" name="format" value="video" checked>
-            <span class="format-body">
-              <svg class="format-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h11a2 2 0 0 1 2 2v2.5l4-2.5v10l-4-2.5V17a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/></svg>
-              <span class="format-name" data-s="video"></span>
-              <span class="format-sub" data-s="videoHint"></span>
-            </span>
-          </label>
-          <label class="format">
-            <input type="radio" name="format" value="audio">
-            <span class="format-body">
-              <svg class="format-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v10.6A3.5 3.5 0 1 0 11 18V8h7V4z"/></svg>
-              <span class="format-name" data-s="audio"></span>
-              <span class="format-sub" data-s="audioHint"></span>
-            </span>
-          </label>
-        </fieldset>
-
-        <p class="hint subtle" id="limit-hint"></p>
-        <p class="alert" id="form-error" role="alert" hidden></p>
-        <button type="submit" class="btn primary block" id="submit" disabled></button>
+        <div class="platforms">
+          <span class="hint" data-s="supported"></span>
+          <span class="badge-row" id="platform-row"></span>
+        </div>
       </form>
+
+      <section class="history" aria-labelledby="history-title">
+        <div class="section-head">
+          <h2 class="section-title" id="history-title" data-s="historyTitle"></h2>
+          <button type="button" class="link-btn" id="refresh" data-s="refresh"></button>
+        </div>
+        <ul class="history-list card flush" id="history-list" hidden></ul>
+        <p class="empty" id="history-empty" data-s="historyEmpty" hidden></p>
+      </section>
+
+      <footer class="foot">
+        <p data-s="footer"></p>
+        <button type="button" class="link-btn" id="terms" data-s="terms" hidden></button>
+      </footer>
     </section>
 
-    <section class="jobs" id="jobs" aria-labelledby="jobs-title" hidden>
-      <h2 class="section-title" id="jobs-title" data-s="activeTitle"></h2>
-      <div id="job-list" class="job-list"></div>
-    </section>
+    <!-- 2. Preview -->
+    <section class="screen" id="screen-preview" aria-labelledby="preview-title" hidden>
+      <article class="card media" id="media" aria-busy="true">
+        <div class="thumb" id="thumb">
+          <img id="thumb-img" alt="" referrerpolicy="no-referrer" decoding="async" hidden>
+          <span class="thumb-badge" id="thumb-platform"></span>
+          <span class="duration" id="thumb-duration" hidden></span>
+        </div>
+        <div class="media-text">
+          <h1 class="media-title" id="preview-title"><span class="skeleton line"></span><span class="skeleton line short"></span></h1>
+          <p class="media-sub" id="preview-uploader"><span class="skeleton line tiny"></span></p>
+        </div>
+      </article>
+      <p class="sr-only" id="preview-status" role="status" aria-live="polite"></p>
 
-    <section class="history" aria-labelledby="history-title">
-      <div class="section-head">
-        <h2 class="section-title" id="history-title" data-s="historyTitle"></h2>
-        <button type="button" class="link-btn" id="refresh" data-s="refresh"></button>
+      <div id="options" hidden>
+        <div class="group">
+          <p class="label" id="fmt-label" data-s="formatLabel"></p>
+          <div class="segmented" role="radiogroup" aria-labelledby="fmt-label" id="fmt-group">
+            <button type="button" role="radio" class="seg" data-fmt="video" data-s="video"></button>
+            <button type="button" role="radio" class="seg" data-fmt="audio" data-s="audio"></button>
+          </div>
+          <p class="hint" id="fmt-hint"></p>
+        </div>
+
+        <div class="group" id="quality-group">
+          <p class="label" id="q-label" data-s="qualityLabel"></p>
+          <div class="chips" role="radiogroup" aria-labelledby="q-label" id="quality-chips"></div>
+        </div>
+
+        <div class="group">
+          <p class="label" id="dl-label" data-s="deliveryLabel"></p>
+          <div class="segmented" role="radiogroup" aria-labelledby="dl-label" id="delivery-group">
+            <button type="button" role="radio" class="seg" data-delivery="device" data-s="toDevice"></button>
+            <button type="button" role="radio" class="seg" data-delivery="chat" data-s="toChat"></button>
+          </div>
+          <p class="hint" id="delivery-hint"></p>
+        </div>
       </div>
-      <ul class="history-list card flush" id="history-list" hidden></ul>
-      <p class="empty" id="history-empty" data-s="historyEmpty" hidden></p>
     </section>
 
-    <footer class="foot">
-      <p data-s="footer"></p>
-      <button type="button" class="link-btn" id="terms" data-s="terms" hidden></button>
-    </footer>
+    <!-- 3. Progress -->
+    <section class="screen" id="screen-progress" aria-labelledby="progress-title" hidden>
+      <article class="card mini">
+        <div class="mini-thumb" id="mini-thumb"></div>
+        <div class="mini-text">
+          <h1 class="mini-title" id="progress-title"></h1>
+          <p class="media-sub" id="progress-meta"></p>
+        </div>
+      </article>
+      <div class="card progress-card">
+        <p class="stage" id="stage" role="status" aria-live="polite"></p>
+        <div class="bar" id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-labelledby="stage">
+          <span class="bar-fill" id="bar-fill"></span>
+        </div>
+        <p class="hint" data-s="keepOpen"></p>
+      </div>
+      <button type="button" class="btn text danger block" id="cancel" data-s="cancel"></button>
+    </section>
+
+    <!-- 4. Ready -->
+    <section class="screen center" id="screen-ready" aria-labelledby="ready-title" hidden>
+      <div class="check" aria-hidden="true">
+        <svg viewBox="0 0 52 52"><circle cx="26" cy="26" r="24"/><path d="M15 27l7 7 15-15"/></svg>
+      </div>
+      <h1 class="title" id="ready-title"></h1>
+      <p class="lede" id="ready-body"></p>
+      <p class="hint" id="ready-note"></p>
+      <button type="button" class="btn text block" id="another" data-s="another"></button>
+    </section>
+
+    <!-- 5. Error -->
+    <section class="screen center" id="screen-error" aria-labelledby="error-title" hidden>
+      <div class="state-icon error-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-2h2zm0-4h-2V7h2z"/></svg>
+      </div>
+      <h1 class="title" id="error-title" data-s="errorTitle"></h1>
+      <p class="lede" id="error-body" role="alert"></p>
+      <div class="actions" id="error-actions"></div>
+    </section>
+
+    <!-- In-page action button: used only when Telegram's MainButton is unavailable. -->
+    <div class="dock" id="dock" hidden>
+      <button type="button" class="btn primary block" id="main-btn"></button>
+    </div>
   </main>
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
