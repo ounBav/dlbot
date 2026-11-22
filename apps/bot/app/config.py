@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     # Longest video accepted, in seconds. 0 = no limit (open question Q4 in CLAUDE.md).
     max_duration_sec: int = 0
 
+    # Mini App "TikTok profile" tab (app/profiles.py). "All" lists at most PROFILE_MAX_VIDEOS.
+    profile_max_videos: int = 200
+    # Videos sent to the chat in one batch (capped at 20 in code: the UI tracks them through
+    # GET /api/downloads, which returns the last 20 jobs).
+    profile_max_send: int = 10
+    # A listing is one-time: dropped on send/discard, otherwise forgotten after this many minutes.
+    profile_scan_ttl_min: int = 15
+    profile_scan_rate_per_minute: int = 3
+    profile_scan_attempts: int = 2
+
     @property
     def admin_id_set(self) -> set[int]:
         return {int(x) for x in self.admin_ids.split(",") if x.strip().isdigit()}

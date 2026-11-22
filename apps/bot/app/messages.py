@@ -49,6 +49,18 @@ def from_miniapp(platform_label: str, fmt: str) -> str:
     kind = "🎵 Audio" if fmt == "audio" else "🎬 Video"
     return f"📱 {platform_label} link received from the app ({kind})."
 
+
+def from_profile(count: int, username: str) -> str:
+    """One message for a whole Mini App "TikTok profile" batch (no per-video status messages)."""
+    noun = "video" if count == 1 else "videos"
+    return f"📱 Sending {count} TikTok {noun} from @{html.escape(username)}. They will arrive here one by one."
+
+
+def batch_item_failed(code: str, title: str, ref: str, limit_mb: int) -> str:
+    """A profile-batch video failed. It has no status message to edit, so say which one."""
+    name = html.escape((title or "TikTok video")[:80])
+    return f"<b>{name}</b>\n{error(code, ref=ref, limit_mb=limit_mb)}"
+
 # Telegram "Menu" button (setMyCommands). Same wording as HELP. /admin is deliberately hidden.
 BOT_COMMANDS = [
     ("start", "Welcome message"),

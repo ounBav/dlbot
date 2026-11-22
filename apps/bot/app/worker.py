@@ -157,6 +157,14 @@ def _fail(job: dict, code: str, tg: TelegramClient, extra: dict, detail: str = "
     store.finish_request(job["db_id"], "failed", error_code=code)
     _progress(job["db_id"], stage="failed", error_code=code)
     text = messages.error(code, ref=job["db_id"][:8], limit_mb=s.max_upload_mb)
+    if job.get("message_id") is None and job.get("delivery", "chat") == "chat" and job.get("chat_id"):
+        # Profile-batch video: no status message to edit, so tell the chat which one failed.
+        try:
+            tg.send_message(job["chat_id"], messages.batch_item_failed(
+                code, job.get("title") or "", ref=job["db_id"][:8], limit_mb=s.max_upload_mb))
+        except TelegramError:
+            log.warning("could not report batch failure", extra=extra)
+        return
     _edit(tg, job, text)
 
 
