@@ -60,7 +60,14 @@ def _options(fmt: str, out_dir: str, max_bytes: int) -> dict:
         # Prefer mp4 so Telegram can play it inline.
         # TODO(FR-04, spike): TikTok no-watermark. Verify which format_id yt-dlp returns
         # for TikTok in the spike, then add a format filter that prefers non-watermarked streams.
-        options["format"] = "best[ext=mp4]/best"
+        # YouTube mostly serves video and audio as separate streams, so a single-file "best"
+        # often matches nothing. Merge the best <=720p mp4 video with m4a audio (ffmpeg), and fall
+        # back to any single file. 720p keeps most clips under Telegram's 50 MB bot upload limit.
+        options["format"] = (
+            "bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]"
+            "/bv*[height<=720]+ba/b[height<=720]/b"
+        )
+        options["merge_output_format"] = "mp4"
     return options
 
 

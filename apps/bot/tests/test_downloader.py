@@ -15,3 +15,10 @@ def test_classify_private():
 
 def test_classify_unknown_defaults_to_failed():
     assert classify_error("something odd happened") == "E-FAILED"
+
+
+def test_video_format_merges_separate_streams_into_mp4():
+    from app.downloader import _options
+    opts = _options("video", "/tmp/x", 50 * 1024 * 1024)
+    assert "+ba" in opts["format"] and opts["format"].endswith("/b")
+    assert opts["merge_output_format"] == "mp4"
