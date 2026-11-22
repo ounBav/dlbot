@@ -26,6 +26,12 @@ services:
         sync: false
       - key: TERMS_URL
         sync: false
+      # Public URL of the bot-miniapp static site (e.g. https://bot-miniapp.onrender.com/).
+      # Enables the Mini App menu button and is added to the API's CORS allow-list.
+      - key: MINIAPP_URL
+        sync: false
+      - key: MINIAPP_AUTH_MAX_AGE
+        value: "86400"
       - key: DB_HOST
         fromDatabase:
           name: bot-db
@@ -118,6 +124,36 @@ services:
         value: "3"
       - key: TEMP_DIR
         value: /tmp/dlbot
+
+  # Telegram Mini App: static files from apps/miniapp, no dependencies. Render builds it (a copy
+  # plus one generated config.js) and redeploys only when apps/miniapp changes.
+  - type: web
+    name: bot-miniapp
+    runtime: static
+    rootDir: apps/miniapp
+    buildCommand: >-
+      rm -rf dist && mkdir dist && cp -r index.html styles.css src dist/ &&
+      printf 'window.MINIAPP_CONFIG = { apiBase: "%s" };\n' "${API_BASE_URL%/}" > dist/config.js
+    staticPublishPath: dist
+    buildFilter:
+      paths: ["apps/miniapp/**"]
+      ignoredPaths: ["apps/miniapp/tests/**", "apps/miniapp/**/*.md"]
+    headers:
+      # Files are not content-hashed: always revalidate so users get the new version after a deploy.
+      - path: /*
+        name: Cache-Control
+        value: no-cache
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: no-referrer
+      # No X-Frame-Options: Telegram Web (web.telegram.org) shows Mini Apps in an iframe.
+    envVars:
+      # Public URL of bot-webhook, e.g. https://bot-webhook.onrender.com (same as PUBLIC_BASE_URL).
+      - key: API_BASE_URL
+        sync: false
 
   - type: keyvalue
     name: bot-redis

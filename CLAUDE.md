@@ -57,8 +57,20 @@ Redis queue ──BRPOP──▶ worker (app/worker.py, N threads)
 | `app/url_utils.py` | URL extraction, host allow-list, `url_hash` |
 | `app/config.py` | `Settings` (pydantic-settings), read from env / `.env` |
 | `app/log.py` | JSON logging. Pass `extra={"req_id", "user_id", "platform", "code"}`. |
+| `app/api.py` | Mini App HTTP API under `/api` (me, create/list/get/cancel downloads). Read-only on polls. |
+| `app/jobs.py` | `submit()`: cache hit or enqueue. Shared by chat callbacks and the Mini App API. |
+| `app/webapp_auth.py` | Validates Mini App `initData` (HMAC with the bot token, `auth_date` max age) |
 | `migrations/*.sql` | Schema. Applied on web startup. Must be idempotent. |
 | `scripts/set_webhook.py` | One-off: register the Telegram webhook |
+
+Paths above are relative to `apps/bot/`. The repo is a monorepo:
+
+| Path | What |
+|---|---|
+| `apps/bot/` | Python web + worker (one Docker image) |
+| `apps/miniapp/` | Telegram Mini App: static HTML/CSS/ES modules, no build, no deps. See its README. Copy lives in `src/strings.js`. Tests: `npm test` (Node 20+). Hosted as the Render static site `bot-miniapp`. |
+
+Mini App job stages (Redis `job:<db_id>`, then the DB): `queued → downloading → (retrying) → uploading → done | failed | cancelled`. The API reports `expired` when a job is not final, its progress hash is gone, and it is older than `REQUEST_TTL`.
 
 ### Callback protocol
 
@@ -127,9 +139,11 @@ Commands: `/start /help /status /cancel /terms /admin`. Plus `/language` when FR
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# quality gate (run before every commit)
+# quality gate (run before every commit; from apps/bot)
 python -m compileall -q app scripts tests
 pytest -q
+# Mini App (from apps/miniapp)
+npm run check && npm test
 
 # local stack (web :8000, worker, postgres, redis)
 cp .env.example .env && docker compose up --build

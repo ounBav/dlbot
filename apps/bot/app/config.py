@@ -2,6 +2,7 @@ import logging
 import os
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -40,9 +41,22 @@ class Settings(BaseSettings):
     max_job_attempts: int = 3
     temp_dir: str = "/tmp/dlbot"
 
+    # Telegram Mini App (apps/miniapp). Empty MINIAPP_URL = Mini App disabled (no menu button).
+    miniapp_url: str = ""
+    miniapp_auth_max_age: int = 86400       # reject initData older than this (seconds)
+    cors_origins: str = ""                   # extra comma-separated origins, e.g. local Vite dev
+
     @property
     def admin_id_set(self) -> set[int]:
         return {int(x) for x in self.admin_ids.split(",") if x.strip().isdigit()}
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        origins = [o.strip().rstrip("/") for o in self.cors_origins.split(",") if o.strip()]
+        if self.miniapp_url:
+            parts = urlsplit(self.miniapp_url)
+            origins.append(f"{parts.scheme}://{parts.netloc}")
+        return sorted(set(origins))
 
 
 @lru_cache

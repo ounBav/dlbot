@@ -17,8 +17,8 @@ services:
     ports: ["6379:6379"]
 
   web:
-    build: .
-    env_file: .env
+    build: ./apps/bot
+    env_file: apps/bot/.env
     environment:
       DB_HOST: db
       DB_PORT: "5432"
@@ -32,12 +32,12 @@ services:
     depends_on: [db, redis]
 
   worker:
-    build: .
+    build: ./apps/bot
     command: python -m app.worker
     # The image HEALTHCHECK curls /health, which only the web service serves.
     healthcheck:
       disable: true
-    env_file: .env
+    env_file: apps/bot/.env
     environment:
       DB_HOST: db
       DB_PORT: "5432"
@@ -47,3 +47,11 @@ services:
       DB_CONNECTION: postgres
       REDIS_URL: redis://redis:6379/0
     depends_on: [db, redis]
+
+  # Mini App static files on :5173 (live-mounted, no build). config.js points at http://localhost:8000.
+  # Telegram only opens HTTPS Mini Apps: tunnel this port (ngrok) and set MINIAPP_URL + CORS_ORIGINS.
+  miniapp:
+    image: python:3.12-alpine
+    command: python -m http.server 5173 --directory /srv
+    volumes: ["./apps/miniapp:/srv:ro"]
+    ports: ["5173:5173"]

@@ -40,6 +40,15 @@ NO_ACTIVE_JOB = "There is no active download to cancel."
 CACHED_CAPTION = "♻️ Sent from cache"
 ADMIN_USAGE = "Usage: /admin stats | /admin ban <telegram_id> | /admin unban <telegram_id>"
 
+# Mini App (apps/miniapp). Button labels are short: Telegram truncates long ones.
+OPEN_APP = "📱 Open app"
+MENU_BUTTON = "Download"
+
+
+def from_miniapp(platform_label: str, fmt: str) -> str:
+    kind = "🎵 Audio" if fmt == "audio" else "🎬 Video"
+    return f"📱 {platform_label} link received from the app ({kind})."
+
 # Telegram "Menu" button (setMyCommands). Same wording as HELP. /admin is deliberately hidden.
 BOT_COMMANDS = [
     ("start", "Welcome message"),

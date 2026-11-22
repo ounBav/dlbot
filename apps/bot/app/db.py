@@ -84,26 +84,52 @@ def audit(admin_id: int, action: str, target_id: int | None) -> None:
         )
 
 
-def create_request(telegram_id: int, url: str, platform: str, fmt: str) -> str:
+def create_request(telegram_id: int, url: str, platform: str, fmt: str, source: str = "chat") -> str:
     with pool().connection() as conn:
         row = _execute(
             conn,
-            """INSERT INTO requests (telegram_id, url, url_hash, platform, format)
-               VALUES (%s, %s, %s, %s, %s) RETURNING id""",
-            (telegram_id, url, url_hash(url), platform, fmt),
+            """INSERT INTO requests (telegram_id, url, url_hash, platform, format, source)
+               VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+            (telegram_id, url, url_hash(url), platform, fmt, source),
         ).fetchone()
     return str(row["id"])
 
 
 def finish_request(request_id: str, status: str, error_code: str | None = None,
-                   file_size: int | None = None, duration_ms: int | None = None) -> None:
+                   file_size: int | None = None, duration_ms: int | None = None,
+                   title: str | None = None) -> None:
     with pool().connection() as conn:
         _execute(
             conn,
             """UPDATE requests SET status = %s, error_code = %s, file_size = %s,
-                   duration_ms = %s, finished_at = now() WHERE id = %s""",
-            (status, error_code, file_size, duration_ms, request_id),
+                   duration_ms = %s, title = COALESCE(%s, title), finished_at = now() WHERE id = %s""",
+            (status, error_code, file_size, duration_ms, title, request_id),
         )
+
+
+_REQUEST_COLUMNS = "id::text AS id, url, platform, format, status, error_code, title, file_size, created_at"
+
+
+def get_request(request_id: str, telegram_id: int) -> dict | None:
+    """One request, only if it belongs to telegram_id (the Mini App never sees other users' rows)."""
+    with pool().connection() as conn:
+        row = _execute(
+            conn,
+            f"SELECT {_REQUEST_COLUMNS} FROM requests WHERE id = %s AND telegram_id = %s",
+            (request_id, telegram_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def recent_requests(telegram_id: int, limit: int = 20) -> list[dict]:
+    with pool().connection() as conn:
+        rows = _execute(
+            conn,
+            f"""SELECT {_REQUEST_COLUMNS} FROM requests WHERE telegram_id = %s
+                ORDER BY created_at DESC LIMIT %s""",
+            (telegram_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def save_media_cache(url_h: str, fmt: str, file_id: str, title: str, size: int) -> None:

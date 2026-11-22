@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <!-- connect-src is https: (plus localhost for dev) because the API origin comes from config.js at runtime.
+       style-src allows inline styles because telegram-web-app.js may inject its own. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https: http://localhost:8000 http://127.0.0.1:8000; base-uri 'none'; form-action 'none'; object-src 'none'">
+  <title>Media Downloader</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%232481cc' d='M12 3v10.6l3.3-3.3 1.4 1.4L12 16.4l-4.7-4.7 1.4-1.4 3.3 3.3V3zM5 19h14v2H5z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="config.js"></script>
+  <script type="module" src="src/app.js"></script>
+</head>
+<body>
+  <!-- Full-screen states: loading, opened outside Telegram, expired session, banned. -->
+  <div id="state" class="state" role="status" aria-live="polite">
+    <div class="state-icon" id="state-icon" aria-hidden="true"><span class="spinner"></span></div>
+    <h1 class="state-title" id="state-title" data-s="loading">Loading…</h1>
+    <p class="state-body" id="state-body"></p>
+    <button type="button" class="btn secondary" id="state-action" hidden></button>
+  </div>
+
+  <main id="app" class="app" hidden>
+    <header class="top">
+      <div class="top-text">
+        <p class="eyebrow" data-s="appTitle"></p>
+        <h1 class="greeting" id="greeting"></h1>
+      </div>
+      <div class="usage" id="usage" hidden>
+        <span class="usage-text" id="usage-text"></span>
+        <span class="meter" aria-hidden="true"><span class="meter-fill" id="usage-bar"></span></span>
+      </div>
+    </header>
+
+    <section class="card" aria-labelledby="link-label">
+      <form id="form" novalidate>
+        <label class="label" id="link-label" for="link" data-s="linkLabel"></label>
+        <div class="field" id="field">
+          <input id="link" name="link" type="url" inputmode="url" autocomplete="off" autocapitalize="off"
+                 autocorrect="off" spellcheck="false" enterkeyhint="go" maxlength="2048"
+                 data-s-placeholder="linkPlaceholder" aria-describedby="link-hint">
+          <button type="button" class="field-btn" id="paste" data-s="paste" hidden></button>
+          <button type="button" class="field-btn icon" id="clear" data-s-aria="clear" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6L19 6.4 17.6 5 12 10.6z"/></svg>
+          </button>
+        </div>
+        <p class="hint" id="link-hint" aria-live="polite"></p>
+
+        <fieldset class="formats">
+          <legend class="label" data-s="formatLabel"></legend>
+          <label class="format">
+            <input type="radio" name="format" value="video" checked>
+            <span class="format-body">
+              <svg class="format-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h11a2 2 0 0 1 2 2v2.5l4-2.5v10l-4-2.5V17a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/></svg>
+              <span class="format-name" data-s="video"></span>
+              <span class="format-sub" data-s="videoHint"></span>
+            </span>
+          </label>
+          <label class="format">
+            <input type="radio" name="format" value="audio">
+            <span class="format-body">
+              <svg class="format-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4v10.6A3.5 3.5 0 1 0 11 18V8h7V4z"/></svg>
+              <span class="format-name" data-s="audio"></span>
+              <span class="format-sub" data-s="audioHint"></span>
+            </span>
+          </label>
+        </fieldset>
+
+        <p class="hint subtle" id="limit-hint"></p>
+        <p class="alert" id="form-error" role="alert" hidden></p>
+        <button type="submit" class="btn primary block" id="submit" disabled></button>
+      </form>
+    </section>
+
+    <section class="jobs" id="jobs" aria-labelledby="jobs-title" hidden>
+      <h2 class="section-title" id="jobs-title" data-s="activeTitle"></h2>
+      <div id="job-list" class="job-list"></div>
+    </section>
+
+    <section class="history" aria-labelledby="history-title">
+      <div class="section-head">
+        <h2 class="section-title" id="history-title" data-s="historyTitle"></h2>
+        <button type="button" class="link-btn" id="refresh" data-s="refresh"></button>
+      </div>
+      <ul class="history-list card flush" id="history-list" hidden></ul>
+      <p class="empty" id="history-empty" data-s="historyEmpty" hidden></p>
+    </section>
+
+    <footer class="foot">
+      <p data-s="footer"></p>
+      <button type="button" class="link-btn" id="terms" data-s="terms" hidden></button>
+    </footer>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

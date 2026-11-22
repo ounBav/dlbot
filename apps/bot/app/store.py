@@ -69,6 +69,22 @@ def is_cancelled(token: str) -> bool:
     return client().exists(f"cancel:{token}") == 1
 
 
+# --- live job progress (read by the Mini App API; DB holds the final state) ---
+
+def set_progress(db_id: str, **fields) -> None:
+    """Merge fields into job:<db_id>. Stages: queued, downloading, uploading, retrying, done, failed, cancelled."""
+    key = f"job:{db_id}"
+    pipe = client().pipeline()
+    pipe.hset(key, mapping={k: "" if v is None else str(v) for k, v in fields.items()})
+    pipe.expire(key, REQUEST_TTL)
+    pipe.execute()
+
+
+def get_progress(db_id: str) -> dict | None:
+    data = client().hgetall(f"job:{db_id}")
+    return data or None
+
+
 # --- file_id cache ---
 
 def cache_get(url_hash: str, fmt: str) -> str | None:

@@ -6,9 +6,10 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
-from . import db, messages, store
+from . import api, db, messages, store
 from .config import get_settings
 from .handlers import handle_update
 from .log import setup_logging
@@ -43,9 +44,13 @@ async def lifespan(_: FastAPI):
             log.warning(f"Migration failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}")
             await asyncio.sleep(wait_time)
 
-    tg_client = TelegramClient(get_settings().bot_token)
+    s = get_settings()
+    tg_client = TelegramClient(s.bot_token)
+    api.configure(tg_client)
     try:
-        tg_client.set_commands(messages.BOT_COMMANDS)  # idempotent; refreshes the Menu button
+        # idempotent; refreshes the Menu button (opens the Mini App when MINIAPP_URL is set)
+        tg_client.set_commands(messages.BOT_COMMANDS, web_app_url=s.miniapp_url,
+                               web_app_label=messages.MENU_BUTTON)
     except Exception:
         log.exception("could not register bot commands")  # never block startup on this
     yield
@@ -53,6 +58,17 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Media Downloader Bot", docs_url=None, redoc_url=None, lifespan=lifespan)
+
+# The Mini App is a separate static site, so its origin must be allowed explicitly.
+# Auth is a header (no cookies), so credentials stay off.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_settings().cors_origin_list,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
+    max_age=600,
+)
+app.include_router(api.router)
 
 
 @app.get("/health")

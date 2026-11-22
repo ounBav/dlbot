@@ -38,6 +38,7 @@ def process(job: dict, tg: TelegramClient) -> None:
             _finish_cancelled(job, tg)
             return
 
+        _progress(db_id, stage="downloading")
         tg.edit_message(chat_id, message_id, messages.DOWNLOADING)
         result = download(job["url"], fmt, workdir, s.max_upload_mb * 1024 * 1024)
 
@@ -45,6 +46,7 @@ def process(job: dict, tg: TelegramClient) -> None:
             _finish_cancelled(job, tg)
             return
 
+        _progress(db_id, stage="uploading", title=result.title)
         tg.edit_message(chat_id, message_id, messages.UPLOADING)
         caption = messages.caption(result.title, PLATFORM_LABELS[job["platform"]], result.duration)
         file_id = tg.send_file(chat_id, fmt, result.path, caption)
@@ -52,8 +54,9 @@ def process(job: dict, tg: TelegramClient) -> None:
         h = url_hash(job["url"])
         store.cache_set(h, fmt, file_id)
         db.save_media_cache(h, fmt, file_id, result.title, result.size)
-        db.finish_request(db_id, "done", file_size=result.size,
+        db.finish_request(db_id, "done", file_size=result.size, title=result.title,
                           duration_ms=int((time.monotonic() - started) * 1000))
+        _progress(db_id, stage="done")
         tg.edit_message(chat_id, message_id, messages.DONE)
         log.info("job done", extra=extra)
 
@@ -61,6 +64,7 @@ def process(job: dict, tg: TelegramClient) -> None:
         if exc.code == "E-FAILED" and job.get("attempt", 1) < s.max_job_attempts:
             job["attempt"] = job.get("attempt", 1) + 1
             log.warning("retrying job", extra={**extra, "code": exc.code})
+            _progress(db_id, stage="retrying")
             _safe_edit(tg, chat_id, message_id, messages.RETRYING)
             time.sleep(2 * job["attempt"])
             store.enqueue(job)
@@ -80,6 +84,14 @@ def process(job: dict, tg: TelegramClient) -> None:
         shutil.rmtree(workdir, ignore_errors=True)  # media is never kept (NFR-07)
 
 
+def _progress(db_id: str, **fields) -> None:
+    """Best effort: the Mini App's live view must never break a job."""
+    try:
+        store.set_progress(db_id, **fields)
+    except Exception:
+        log.warning("could not record job progress", extra={"req_id": db_id})
+
+
 def _safe_edit(tg: TelegramClient, chat_id: int, message_id: int, text: str) -> None:
     try:
         tg.edit_message(chat_id, message_id, text)
@@ -89,6 +101,7 @@ def _safe_edit(tg: TelegramClient, chat_id: int, message_id: int, text: str) -> 
 
 def _finish_cancelled(job: dict, tg: TelegramClient) -> None:
     db.finish_request(job["db_id"], "cancelled")
+    _progress(job["db_id"], stage="cancelled")
     _safe_edit(tg, job["chat_id"], job["message_id"], messages.CANCELLED)
 
 
@@ -98,6 +111,7 @@ def _fail(job: dict, code: str, tg: TelegramClient, extra: dict, detail: str = "
     if detail:
         log.error("failure detail: %s", detail[:500], extra=extra)
     db.finish_request(job["db_id"], "failed", error_code=code)
+    _progress(job["db_id"], stage="failed", error_code=code)
     text = messages.error(code, ref=job["db_id"][:8], limit_mb=s.max_upload_mb)
     _safe_edit(tg, job["chat_id"], job["message_id"], text)
 

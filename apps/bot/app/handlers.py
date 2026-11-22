@@ -3,10 +3,10 @@
 import logging
 import secrets
 
-from . import db, messages, store
+from . import db, jobs, messages, store
 from .config import get_settings
 from .tg import TelegramClient
-from .url_utils import PLATFORM_LABELS, detect_platform, extract_url, url_hash
+from .url_utils import PLATFORM_LABELS, detect_platform, extract_url
 
 log = logging.getLogger(__name__)
 FORMATS = {"v": "video", "a": "audio"}
@@ -75,7 +75,10 @@ def _handle_command(text: str, chat_id: int, user_id: int, tg: TelegramClient) -
     s = get_settings()
 
     if cmd == "/start":
-        tg.send_message(chat_id, messages.WELCOME)
+        keyboard = None
+        if s.miniapp_url:
+            keyboard = {"inline_keyboard": [[{"text": messages.OPEN_APP, "web_app": {"url": s.miniapp_url}}]]}
+        tg.send_message(chat_id, messages.WELCOME, reply_markup=keyboard)
     elif cmd == "/help":
         tg.send_message(chat_id, messages.HELP)
     elif cmd == "/terms":
@@ -137,24 +140,5 @@ def _handle_callback(cq: dict, tg: TelegramClient) -> None:
     if not store.claim(token, fmt):
         return  # duplicate tap on the same format
 
-    h = url_hash(req["url"])
-    cached = store.cache_get(h, fmt)
-    if cached:
-        tg.send_cached(chat_id, fmt, cached, messages.CACHED_CAPTION)
-        tg.edit_message(chat_id, message_id, messages.DONE)
-        return
-
-    db_id = db.create_request(user_id, req["url"], req["platform"], fmt)
-    store.enqueue({
-        "token": token,
-        "db_id": db_id,
-        "fmt": fmt,
-        "url": req["url"],
-        "platform": req["platform"],
-        "user_id": user_id,
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "attempt": 1,
-    })
-    store.set_active(user_id, token)
-    tg.edit_message(chat_id, message_id, messages.QUEUED)
+    jobs.submit(tg, token=token, user_id=user_id, chat_id=chat_id, message_id=message_id,
+                url=req["url"], platform=req["platform"], fmt=fmt)
