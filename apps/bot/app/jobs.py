@@ -4,7 +4,7 @@ Shared by the chat flow (inline button callback) and the Mini App API so both be
 The status message (chat_id, message_id) must already exist; the worker edits it as it goes.
 """
 
-from . import db, messages, store
+from . import messages, store
 from .tg import TelegramClient
 from .url_utils import url_hash
 
@@ -18,7 +18,7 @@ def submit(tg: TelegramClient, *, token: str, user_id: int, chat_id: int, messag
         tg.edit_message(chat_id, message_id, messages.DONE)
         return None
 
-    db_id = db.create_request(user_id, url, platform, fmt, source=source)
+    db_id = store.create_request(user_id, url, platform, fmt, source=source)
     store.set_progress(db_id, token=token, user_id=user_id, stage="queued")
     store.enqueue({
         "token": token,

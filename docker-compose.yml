@@ -1,52 +1,28 @@
-# Local development: the same images as production, with Postgres and Redis.
-# Own project name so it never clashes with the root Flask API compose (also "dlbot").
+# Local development: the same image as production.
+#   bot      Telegram long polling + in-process download workers + /health and Mini App /api on :8000
+#   miniapp  static Mini App files on :5173
+# No webhook, no tunnel: the bot pulls updates from Telegram (getUpdates), so it works behind NAT.
+# Only ONE process may poll per bot token: running this with the production BOT_TOKEN while Render
+# runs makes both get 409 Conflict. Use a separate dev bot token locally.
 name: dlbot-bot
 
 services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: bot
-      POSTGRES_PASSWORD: bot
-      POSTGRES_DB: bot
-    ports: ["5432:5432"]
-
-  redis:
-    image: redis:7-alpine
-    command: redis-server --maxmemory-policy noeviction
-    ports: ["6379:6379"]
-
-  web:
-    build: .   # root Dockerfile (same file Render and CI build)
+  bot:
+    build: .   # root Dockerfile (same file Render builds)
+    image: dlbot-bot:local
+    # Always rebuild on `docker compose up` (cached layers: seconds). Without this, compose reuses an
+    # existing dlbot-bot:local image and silently runs stale code.
+    pull_policy: build
     env_file: apps/bot/.env
     environment:
-      DB_HOST: db
-      DB_PORT: "5432"
-      DB_SCHEMA: bot
-      DB_USERNAME: bot
-      DB_PASSWORD: bot
-      DB_CONNECTION: postgres
-      REDIS_URL: redis://redis:6379/0
-    # 8082 is the port the local ngrok tunnel forwards to (scripts/ngrok_webhook.py --port 8082)
-    ports: ["8000:8000", "8082:8000"]
-    depends_on: [db, redis]
-
-  worker:
-    build: .
-    command: python -m app.worker
-    # The image HEALTHCHECK curls /health, which only the web service serves.
+      TEMP_DIR: tmp
+    ports: ["8000:8000"]
     healthcheck:
-      disable: true
-    env_file: apps/bot/.env
-    environment:
-      DB_HOST: db
-      DB_PORT: "5432"
-      DB_SCHEMA: bot
-      DB_USERNAME: bot
-      DB_PASSWORD: bot
-      DB_CONNECTION: postgres
-      REDIS_URL: redis://redis:6379/0
-    depends_on: [db, redis]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   # Mini App static files on :5173 (live-mounted, no build). config.js points at http://localhost:8000.
   # Telegram only opens HTTPS Mini Apps: tunnel this port (ngrok) and set MINIAPP_URL + CORS_ORIGINS.

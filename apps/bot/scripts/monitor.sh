@@ -85,30 +85,6 @@ get_metrics() {
     echo "  • Error rate < 5%"
 }
 
-get_database_status() {
-    echo ""
-    echo -e "${YELLOW}Database Status${NC}"
-    echo "Check in Render dashboard:"
-    echo "  Render Dashboard → bot-db → Status"
-    echo ""
-    echo "Watch for:"
-    echo "  • Status: Available"
-    echo "  • Active connections: 2-5 (normal)"
-    echo "  • No connection errors"
-}
-
-get_redis_status() {
-    echo ""
-    echo -e "${YELLOW}Redis Status${NC}"
-    echo "Check in Render dashboard:"
-    echo "  Render Dashboard → bot-redis"
-    echo ""
-    echo "Watch for:"
-    echo "  • Status: Active"
-    echo "  • Memory usage < 100MB"
-    echo "  • Eviction policy: noeviction"
-}
-
 run_check() {
     clear
     echo "================================"
@@ -137,8 +113,6 @@ run_check() {
     fi
 
     get_service_status "bot-webhook"
-    get_database_status
-    get_redis_status
     get_metrics
     get_logs
 

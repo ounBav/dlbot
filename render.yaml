@@ -1,26 +1,26 @@
-# Render Blueprint: web webhook + background worker + Postgres + Key Value (Redis)
+# Render Blueprint: ONE web service (Telegram long polling + in-process download workers) + the Mini App site.
 #
-# Fast deploys: Render does NOT build anything. GitHub Actions (.github/workflows/deploy.yml)
-# runs the tests, builds ONE image, pushes it to GHCR, then calls each service's deploy hook
-# with ?imgURL=ghcr.io/ounbav/dlbot:<commit-sha>. Image-backed services never auto-deploy,
-# so a push that fails tests never reaches Render. See RENDER_DEPLOY.md for first-time setup.
+# No Postgres, no Redis: state is an in-memory singleton (apps/bot/app/store.py), so the bot
+# service must run as a single instance with a single process. A redeploy/restart clears the
+# queue, bans, stats and the file_id cache (accepted for v1).
+# Updates are pulled with getUpdates (no webhook), so the plan must not sleep when idle (no free plan).
+# Render builds the root Dockerfile on every push to main (autoDeploy).
 services:
   - type: web
     name: bot-webhook
-    runtime: image
-    image:
-      url: ghcr.io/ounbav/dlbot:latest
-      creds:
-        fromRegistryCreds:
-          name: ghcr-dlbot   # Workspace Settings → Container Registry Credentials
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     plan: starter
+    numInstances: 1          # in-memory state + one getUpdates consumer per token: never scale out
     healthCheckPath: /health
+    autoDeploy: true
+    # Only rebuild/redeploy when something inside the image changes (docs, tests, scripts and the
+    # Mini App never trigger a bot deploy). Keep in sync with .dockerignore.
+    buildFilter:
+      paths: ["apps/bot/app/**", "apps/bot/requirements.txt", "Dockerfile", ".dockerignore", "render.yaml"]
     envVars:
       - key: BOT_TOKEN
-        sync: false
-      - key: WEBHOOK_SECRET
-        generateValue: true
-      - key: PUBLIC_BASE_URL
         sync: false
       - key: ADMIN_IDS
         sync: false
@@ -32,98 +32,20 @@ services:
         sync: false
       - key: MINIAPP_AUTH_MAX_AGE
         value: "86400"
-      - key: DB_HOST
-        fromDatabase:
-          name: bot-db
-          property: host
-      - key: DB_PORT
-        fromDatabase:
-          name: bot-db
-          property: port
-      - key: DB_SCHEMA
-        fromDatabase:
-          name: bot-db
-          property: database
-      - key: DB_USERNAME
-        fromDatabase:
-          name: bot-db
-          property: user
-      - key: DB_PASSWORD
-        fromDatabase:
-          name: bot-db
-          property: password
-      - key: DB_CONNECTION
-        value: postgres
-      - key: DB_LOGGING
-        value: "false"
-      - key: DB_SYNC
-        value: "true"
-      - key: REDIS_URL
-        fromService:
-          type: keyvalue
-          name: bot-redis
-          property: connectionString
+      - key: POLL_TIMEOUT
+        value: "25"
       - key: MAX_UPLOAD_MB
         value: "50"
       - key: RATE_PER_MINUTE
         value: "5"
       - key: RATE_PER_DAY
         value: "30"
-      - key: TEMP_DIR
-        value: /tmp/dlbot
-
-  - type: worker
-    name: bot-worker
-    runtime: image
-    image:
-      url: ghcr.io/ounbav/dlbot:latest   # same image as the web service
-      creds:
-        fromRegistryCreds:
-          name: ghcr-dlbot
-    plan: standard
-    dockerCommand: python -m app.worker
-    envVars:
-      - key: BOT_TOKEN
-        sync: false
-      - key: DB_HOST
-        fromDatabase:
-          name: bot-db
-          property: host
-      - key: DB_PORT
-        fromDatabase:
-          name: bot-db
-          property: port
-      - key: DB_SCHEMA
-        fromDatabase:
-          name: bot-db
-          property: database
-      - key: DB_USERNAME
-        fromDatabase:
-          name: bot-db
-          property: user
-      - key: DB_PASSWORD
-        fromDatabase:
-          name: bot-db
-          property: password
-      - key: DB_CONNECTION
-        value: postgres
-      - key: DB_LOGGING
-        value: "false"
-      - key: DB_SYNC
-        value: "true"
-      - key: REDIS_URL
-        fromService:
-          type: keyvalue
-          name: bot-redis
-          property: connectionString
-      - key: MAX_UPLOAD_MB
-        value: "50"
       - key: WORKER_CONCURRENCY
         value: "2"
       - key: MAX_JOB_ATTEMPTS
         value: "3"
       - key: TEMP_DIR
-        value: /tmp/dlbot
+        value: tmp
 
   # Telegram Mini App: static files from apps/miniapp, no dependencies. Render builds it (a copy
   # plus one generated config.js) and redeploys only when apps/miniapp changes.
@@ -151,17 +73,6 @@ services:
         value: no-referrer
       # No X-Frame-Options: Telegram Web (web.telegram.org) shows Mini Apps in an iframe.
     envVars:
-      # Public URL of bot-webhook, e.g. https://bot-webhook.onrender.com (same as PUBLIC_BASE_URL).
+      # Public URL of bot-webhook, e.g. https://bot-webhook.onrender.com .
       - key: API_BASE_URL
         sync: false
-
-  - type: keyvalue
-    name: bot-redis
-    plan: starter
-    # Must NOT evict: the job queue lives in Redis. Cache keys carry TTLs instead.
-    maxmemoryPolicy: noeviction
-    ipAllowList: []   # internal connections only
-
-databases:
-  - name: bot-db
-    plan: basic-256mb

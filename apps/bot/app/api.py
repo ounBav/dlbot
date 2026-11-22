@@ -15,7 +15,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
-from . import db, jobs, messages, store
+from . import jobs, messages, store
 from .config import get_settings
 from .tg import TelegramClient, TelegramError
 from .url_utils import PLATFORM_HOSTS, PLATFORM_LABELS, detect_platform, extract_url
@@ -31,7 +31,7 @@ def _no_store(response: Response) -> None:
 
 router = APIRouter(prefix="/api", dependencies=[Depends(_no_store)])
 
-# "expired": the DB row never reached a final state and its live progress is gone
+# "expired": the request never reached a final state and its live progress is gone
 # (worker lost the job, or it sat in the queue past REQUEST_TTL). Shown as final so the UI stops polling.
 FINAL_STAGES = {"done", "failed", "cancelled", "expired"}
 STALE_AFTER = timedelta(seconds=store.REQUEST_TTL)
@@ -64,14 +64,14 @@ def current_user(authorization: str | None = Header(default=None)) -> dict:
         log.info("rejected initData", extra={"code": str(exc)})
         raise _fail(401, "E-AUTH")
     # Read-only on purpose: the UI polls, so writes happen only in /me and POST /downloads.
-    if db.is_banned(user["id"]):
+    if store.is_banned(user["id"]):
         raise _fail(403, "E-BANNED")
     return user
 
 
 def _remember(user: dict) -> None:
     """Create/refresh the users row (requests.telegram_id references it)."""
-    db.upsert_user(user["id"], user.get("username"))
+    store.upsert_user(user["id"], user.get("username"))
 
 
 def _is_stale(created_at) -> bool:
@@ -83,7 +83,7 @@ def _is_stale(created_at) -> bool:
 
 
 def _job_view(row: dict) -> dict:
-    """DB row + live Redis stage while the job is still running."""
+    """Request log row + live stage while the job is still running."""
     status = row["status"]
     title = row.get("title")
     if status not in FINAL_STAGES:
@@ -111,7 +111,7 @@ def _owned_request(job_id: str, user_id: int) -> dict:
         uuid.UUID(job_id)
     except ValueError:
         raise _fail(404, "E-NOTFOUND")
-    row = db.get_request(job_id, user_id)
+    row = store.get_request(job_id, user_id)
     if row is None:
         raise _fail(404, "E-NOTFOUND")
     return row
@@ -175,7 +175,7 @@ def create_download(body: DownloadIn, user: dict = Depends(current_user), tg: Te
 
 @router.get("/downloads")
 def list_downloads(user: dict = Depends(current_user)):
-    return {"items": [_job_view(r) for r in db.recent_requests(user["id"], limit=20)]}
+    return {"items": [_job_view(r) for r in store.recent_requests(user["id"], limit=20)]}
 
 
 @router.get("/downloads/{job_id}")

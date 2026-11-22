@@ -6,7 +6,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app import api, db, store
+from app import api, store
 from app.config import Settings
 from app.tg import TelegramError
 
@@ -35,8 +35,7 @@ class FakeTg:
 
 @pytest.fixture
 def env(monkeypatch):
-    settings = Settings(_env_file=None, bot_token=TOKEN, db_host="db", db_schema="bot", db_username="bot",
-                        db_password="bot", redis_url="redis://unused", rate_per_minute=5, rate_per_day=30,
+    settings = Settings(_env_file=None, bot_token=TOKEN, rate_per_minute=5, rate_per_day=30,
                         miniapp_url="", cors_origins="")
     monkeypatch.setattr(api, "get_settings", lambda: settings)
 
@@ -55,11 +54,11 @@ def env(monkeypatch):
         return row if row and row["uid"] == uid else None
 
     state["upserts"] = []
-    monkeypatch.setattr(db, "upsert_user", lambda uid, username: state["upserts"].append(uid))
-    monkeypatch.setattr(db, "is_banned", lambda uid: uid in state["banned"])
-    monkeypatch.setattr(db, "create_request", create_request)
-    monkeypatch.setattr(db, "get_request", get_request)
-    monkeypatch.setattr(db, "recent_requests",
+    monkeypatch.setattr(store, "upsert_user", lambda uid, username: state["upserts"].append(uid))
+    monkeypatch.setattr(store, "is_banned", lambda uid: uid in state["banned"])
+    monkeypatch.setattr(store, "create_request", create_request)
+    monkeypatch.setattr(store, "get_request", get_request)
+    monkeypatch.setattr(store, "recent_requests",
                         lambda uid, limit=20: [r for r in state["rows"].values() if r["uid"] == uid][:limit])
     monkeypatch.setattr(store, "rate_limit_hit", lambda uid, m, d: (True, 0) if state["rate_ok"] else (False, 42))
     monkeypatch.setattr(store, "usage_today", lambda uid: 3)

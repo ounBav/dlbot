@@ -1,8 +1,7 @@
-# CI + fast Render deploy.
-#   test   -> compileall + pytest (every push / PR)
-#   build  -> ONE image, pushed to GHCR as :<sha> and :latest (main only)
-#   deploy -> Render deploy hooks for web + worker, pinned to :<sha> (main only)
-# Render never builds: it only pulls the image, so a deploy is pull + start.
+# CI. Render itself builds the root Dockerfile and deploys on every push to main (render.yaml).
+#   test         -> compileall + pytest
+#   test-miniapp -> Mini App checks
+#   docker       -> the production image still builds
 name: deploy
 
 on:
@@ -47,58 +46,10 @@ jobs:
       - run: npm run check
       - run: npm test
 
-  build:
-    needs: [test, test-miniapp]
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+  # Smoke-build the production image so a broken Dockerfile fails CI, not the Render deploy.
+  docker:
+    needs: [test]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      image: ${{ steps.name.outputs.image }}
     steps:
       - uses: actions/checkout@v4
-      - id: name
-        # GHCR image names must be lowercase (ounBav/dlbot -> ounbav/dlbot)
-        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .              # root Dockerfile; .dockerignore whitelists apps/bot sources
-          platforms: linux/amd64          # Render runs amd64
-          push: true
-          tags: |
-            ${{ steps.name.outputs.image }}:${{ github.sha }}
-            ${{ steps.name.outputs.image }}:latest
-          # Layer cache between runs: a code-only change rebuilds in seconds.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - name: Trigger Render deploys (web + worker) with this commit's image
-        env:
-          HOOK_WEB: ${{ secrets.RENDER_DEPLOY_HOOK_WEB }}
-          HOOK_WORKER: ${{ secrets.RENDER_DEPLOY_HOOK_WORKER }}
-          IMAGE: ${{ needs.build.outputs.image }}:${{ github.sha }}
-        run: |
-          if [ -z "$HOOK_WEB" ] || [ -z "$HOOK_WORKER" ]; then
-            echo "::warning::RENDER_DEPLOY_HOOK_WEB / RENDER_DEPLOY_HOOK_WORKER not set; image pushed, deploy skipped."
-            exit 0
-          fi
-          img=$(python3 -c 'import os,urllib.parse; print(urllib.parse.quote(os.environ["IMAGE"], safe=""))')
-          for name in web worker; do
-            hook=$([ "$name" = web ] && echo "$HOOK_WEB" || echo "$HOOK_WORKER")
-            # 200 = deploy started, 202 = queued behind a running deploy. Never echo the hook (it is a secret).
-            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hook}&imgURL=${img}")
-            echo "$name: HTTP $code"
-            case "$code" in 200|202) ;; *) echo "::error::$name deploy hook failed (HTTP $code)"; exit 1 ;; esac
-          done
+      - run: docker build -t dlbot:ci .

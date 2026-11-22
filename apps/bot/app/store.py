@@ -1,108 +1,299 @@
-"""Redis access: job queue, pending requests, cache, rate limits, cancel flags, dedupe."""
+"""In-memory state: one thread-safe singleton for the whole process.
 
-import json
+Replaces Redis and Postgres. Holds the job queue, pending requests, file_id cache, rate limits,
+cancel flags, update dedupe, users/bans and a bounded request log.
+
+Trade-off (accepted for v1): everything lives in RAM, so a restart or redeploy forgets queued jobs,
+bans, stats and the file_id cache. The web server MUST run as a single process (one uvicorn worker),
+because each process would otherwise get its own copy of this state.
+"""
+
+import queue
+import threading
 import time
+import uuid
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 
-import redis
+from .url_utils import url_hash
 
-from .config import get_settings
-
-REQUEST_TTL = 3600          # pending requests and active job markers
+REQUEST_TTL = 3600          # pending requests, claims, cancel flags, active job markers, progress
 CACHE_TTL = 30 * 86400      # Telegram file_id cache
 UPDATE_TTL = 86400          # Telegram update_id dedupe window
-QUEUE_KEY = "queue:downloads"
+MAX_REQUEST_LOG = 5000      # request log rows kept in memory (oldest dropped first)
+_SWEEP_EVERY = 60           # seconds between expired-key sweeps
 
-_client: redis.Redis | None = None
+
+class _TTLDict:
+    """dict with per-key expiry. Not thread-safe on its own: MemoryStore holds the lock."""
+
+    def __init__(self):
+        self._data: dict[str, tuple[float, object]] = {}
+
+    def get(self, key: str, now: float):
+        item = self._data.get(key)
+        if item is None:
+            return None
+        expires, value = item
+        if expires <= now:
+            del self._data[key]
+            return None
+        return value
+
+    def set(self, key: str, value, ttl: float, now: float) -> None:
+        self._data[key] = (now + ttl, value)
+
+    def set_nx(self, key: str, value, ttl: float, now: float) -> bool:
+        if self.get(key, now) is not None:
+            return False
+        self.set(key, value, ttl, now)
+        return True
+
+    def incr(self, key: str, ttl: float, now: float) -> int:
+        """Increment a counter, keeping the expiry set when the counter was created."""
+        if self.get(key, now) is None:
+            self._data[key] = (now + ttl, 1)
+            return 1
+        expires, value = self._data[key]
+        self._data[key] = (expires, value + 1)
+        return value + 1
+
+    def sweep(self, now: float) -> None:
+        for key in [k for k, (exp, _) in self._data.items() if exp <= now]:
+            del self._data[key]
+
+    def __len__(self) -> int:
+        return len(self._data)
 
 
-def client() -> redis.Redis:
-    global _client
-    if _client is None:
-        _client = redis.Redis.from_url(get_settings().redis_url, decode_responses=True, socket_timeout=10)
-    return _client
+class MemoryStore:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._kv = _TTLDict()                      # req:, claim:, active:, cancel:, upd:, rl:, fid:
+        self._progress: dict[str, tuple[float, dict]] = {}
+        self._queue: queue.Queue[dict] = queue.Queue()
+        self._users: dict[int, dict] = {}
+        self._requests: OrderedDict[str, dict] = OrderedDict()
+        self._audit: list[dict] = []
+        self._last_sweep = 0.0
+        self.worker_heartbeat = 0.0
 
+    def _now(self) -> float:
+        now = time.time()
+        if now - self._last_sweep > _SWEEP_EVERY:
+            self._last_sweep = now
+            self._kv.sweep(now)
+            for key in [k for k, (exp, _) in self._progress.items() if exp <= now]:
+                del self._progress[key]
+        return now
+
+    # --- generic key/value with TTL ---
+
+    def kv_get(self, key: str):
+        with self._lock:
+            return self._kv.get(key, self._now())
+
+    def kv_set(self, key: str, value, ttl: float) -> None:
+        with self._lock:
+            self._kv.set(key, value, ttl, self._now())
+
+    def kv_set_nx(self, key: str, value, ttl: float) -> bool:
+        with self._lock:
+            return self._kv.set_nx(key, value, ttl, self._now())
+
+    def kv_incr(self, key: str, ttl: float) -> int:
+        """Increment a counter; the TTL is set when the counter is created."""
+        with self._lock:
+            return self._kv.incr(key, ttl, self._now())
+
+    # --- queue ---
+
+    def enqueue(self, job: dict) -> None:
+        self._queue.put(dict(job))
+
+    def dequeue(self, timeout: float) -> dict | None:
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def queue_size(self) -> int:
+        return self._queue.qsize()
+
+    # --- live job progress ---
+
+    def set_progress(self, db_id: str, fields: dict) -> None:
+        with self._lock:
+            now = self._now()
+            current = self._progress.get(db_id)
+            data = dict(current[1]) if current and current[0] > now else {}
+            data.update(fields)
+            self._progress[db_id] = (now + REQUEST_TTL, data)
+
+    def get_progress(self, db_id: str) -> dict | None:
+        with self._lock:
+            item = self._progress.get(db_id)
+            if item is None or item[0] <= self._now():
+                return None
+            return dict(item[1])
+
+    # --- users ---
+
+    def upsert_user(self, telegram_id: int, username: str | None) -> None:
+        with self._lock:
+            user = self._users.setdefault(telegram_id, {"is_banned": False})
+            user["username"] = username
+
+    def is_banned(self, telegram_id: int) -> bool:
+        with self._lock:
+            return bool(self._users.get(telegram_id, {}).get("is_banned"))
+
+    def set_banned(self, telegram_id: int, banned: bool) -> None:
+        with self._lock:
+            self._users.setdefault(telegram_id, {"username": None})["is_banned"] = banned
+
+    def audit(self, admin_id: int, action: str, target_id: int | None) -> None:
+        with self._lock:
+            self._audit.append({"admin_id": admin_id, "action": action, "target_id": target_id,
+                                "created_at": datetime.now(timezone.utc)})
+            del self._audit[:-1000]
+
+    # --- request log ---
+
+    def create_request(self, telegram_id: int, url: str, platform: str, fmt: str, source: str) -> str:
+        rid = str(uuid.uuid4())
+        with self._lock:
+            self._requests[rid] = {
+                "id": rid, "telegram_id": telegram_id, "url": url, "url_hash": url_hash(url),
+                "platform": platform, "format": fmt, "source": source, "status": "received",
+                "error_code": None, "title": None, "file_size": None, "duration_ms": None,
+                "created_at": datetime.now(timezone.utc), "finished_at": None,
+            }
+            while len(self._requests) > MAX_REQUEST_LOG:
+                self._requests.popitem(last=False)
+        return rid
+
+    def finish_request(self, rid: str, status: str, error_code=None, file_size=None,
+                       duration_ms=None, title=None) -> None:
+        with self._lock:
+            row = self._requests.get(rid)
+            if row is None:
+                return
+            row.update(status=status, error_code=error_code, file_size=file_size,
+                       duration_ms=duration_ms, finished_at=datetime.now(timezone.utc))
+            if title is not None:
+                row["title"] = title
+
+    def get_request(self, rid: str, telegram_id: int) -> dict | None:
+        with self._lock:
+            row = self._requests.get(rid)
+            return _public_row(row) if row and row["telegram_id"] == telegram_id else None
+
+    def recent_requests(self, telegram_id: int, limit: int) -> list[dict]:
+        with self._lock:
+            rows = [r for r in reversed(self._requests.values()) if r["telegram_id"] == telegram_id]
+            return [_public_row(r) for r in rows[:limit]]
+
+    def stats(self) -> dict:
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        with self._lock:
+            rows = [r for r in self._requests.values() if r["created_at"] > since]
+        return {
+            "total": len(rows),
+            "done": sum(r["status"] == "done" for r in rows),
+            "failed": sum(r["status"] == "failed" for r in rows),
+            "users": len({r["telegram_id"] for r in rows}),
+        }
+
+
+_PUBLIC_FIELDS = ("id", "url", "platform", "format", "status", "error_code", "title", "file_size", "created_at")
+
+
+def _public_row(row: dict) -> dict:
+    return {k: row[k] for k in _PUBLIC_FIELDS}
+
+
+# --- the singleton ---
+
+_instance = MemoryStore()
+
+
+def get_store() -> MemoryStore:
+    return _instance
+
+
+def reset() -> None:
+    """Replace the singleton with an empty one. For tests only."""
+    global _instance
+    _instance = MemoryStore()
+
+
+# --- module-level API (what handlers, jobs, api and worker call) ---
 
 def ping() -> bool:
-    return bool(client().ping())
+    return True
 
-
-# --- pending requests (user sent a link, has not chosen a format yet) ---
 
 def save_request(token: str, data: dict) -> None:
-    client().set(f"req:{token}", json.dumps(data), ex=REQUEST_TTL)
+    get_store().kv_set(f"req:{token}", dict(data), REQUEST_TTL)
 
 
 def load_request(token: str) -> dict | None:
-    raw = client().get(f"req:{token}")
-    return json.loads(raw) if raw else None
+    data = get_store().kv_get(f"req:{token}")
+    return dict(data) if data else None
 
 
 def claim(token: str, fmt: str) -> bool:
     """True only for the first tap on a format button (prevents duplicate jobs)."""
-    return bool(client().set(f"claim:{token}:{fmt}", "1", nx=True, ex=REQUEST_TTL))
+    return get_store().kv_set_nx(f"claim:{token}:{fmt}", "1", REQUEST_TTL)
 
-
-# --- job queue (FIFO: LPUSH producer, BRPOP consumer) ---
 
 def enqueue(job: dict) -> None:
-    client().lpush(QUEUE_KEY, json.dumps(job))
+    get_store().enqueue(job)
 
 
-def dequeue(timeout: int = 5) -> dict | None:
-    item = client().brpop(QUEUE_KEY, timeout=timeout)
-    return json.loads(item[1]) if item else None
+def dequeue(timeout: float = 5) -> dict | None:
+    return get_store().dequeue(timeout)
 
 
 def set_active(user_id: int, token: str) -> None:
-    client().set(f"active:{user_id}", token, ex=REQUEST_TTL)
+    get_store().kv_set(f"active:{user_id}", token, REQUEST_TTL)
 
 
 def active_job(user_id: int) -> str | None:
-    return client().get(f"active:{user_id}")
+    return get_store().kv_get(f"active:{user_id}")
 
 
 def mark_cancel(token: str) -> None:
-    client().set(f"cancel:{token}", "1", ex=REQUEST_TTL)
+    get_store().kv_set(f"cancel:{token}", "1", REQUEST_TTL)
 
 
 def is_cancelled(token: str) -> bool:
-    return client().exists(f"cancel:{token}") == 1
+    return get_store().kv_get(f"cancel:{token}") is not None
 
-
-# --- live job progress (read by the Mini App API; DB holds the final state) ---
 
 def set_progress(db_id: str, **fields) -> None:
-    """Merge fields into job:<db_id>. Stages: queued, downloading, uploading, retrying, done, failed, cancelled."""
-    key = f"job:{db_id}"
-    pipe = client().pipeline()
-    pipe.hset(key, mapping={k: "" if v is None else str(v) for k, v in fields.items()})
-    pipe.expire(key, REQUEST_TTL)
-    pipe.execute()
+    """Merge fields into the live progress of a job. Stages: queued, downloading, uploading, retrying,
+    done, failed, cancelled. Values are stored as strings (same shape the Mini App API always had)."""
+    get_store().set_progress(db_id, {k: "" if v is None else str(v) for k, v in fields.items()})
 
 
 def get_progress(db_id: str) -> dict | None:
-    data = client().hgetall(f"job:{db_id}")
-    return data or None
+    return get_store().get_progress(db_id)
 
 
-# --- file_id cache ---
-
-def cache_get(url_hash: str, fmt: str) -> str | None:
-    return client().get(f"fid:{url_hash}:{fmt}")
+def cache_get(url_h: str, fmt: str) -> str | None:
+    return get_store().kv_get(f"fid:{url_h}:{fmt}")
 
 
-def cache_set(url_hash: str, fmt: str, file_id: str) -> None:
-    client().set(f"fid:{url_hash}:{fmt}", file_id, ex=CACHE_TTL)
+def cache_set(url_h: str, fmt: str, file_id: str) -> None:
+    get_store().kv_set(f"fid:{url_h}:{fmt}", file_id, CACHE_TTL)
 
-
-# --- webhook idempotency ---
 
 def dedupe_update(update_id: int) -> bool:
     """Return True if this update is new; False if it was already seen."""
-    return bool(client().set(f"upd:{update_id}", "1", nx=True, ex=UPDATE_TTL))
+    return get_store().kv_set_nx(f"upd:{update_id}", "1", UPDATE_TTL)
 
-
-# --- rate limiting (fixed windows, minute and UTC day) ---
 
 def _keys(user_id: int, now: int) -> tuple[str, str]:
     day = time.strftime("%Y%m%d", time.gmtime(now))
@@ -110,15 +301,12 @@ def _keys(user_id: int, now: int) -> tuple[str, str]:
 
 
 def rate_limit_hit(user_id: int, per_minute: int, per_day: int) -> tuple[bool, int]:
-    """Count one request. Returns (allowed, retry_after_seconds)."""
+    """Count one request (fixed windows: minute and UTC day). Returns (allowed, retry_after_seconds)."""
     now = int(time.time())
     minute_key, day_key = _keys(user_id, now)
-    pipe = client().pipeline()
-    pipe.incr(minute_key)
-    pipe.expire(minute_key, 120)
-    pipe.incr(day_key)
-    pipe.expire(day_key, 90000)
-    minute_count, _, day_count, _ = pipe.execute()
+    s = get_store()
+    minute_count = s.kv_incr(minute_key, 120)
+    day_count = s.kv_incr(day_key, 90000)
     if minute_count > per_minute:
         return False, 60 - (now % 60)
     if day_count > per_day:
@@ -128,10 +316,52 @@ def rate_limit_hit(user_id: int, per_minute: int, per_day: int) -> tuple[bool, i
 
 def usage_today(user_id: int) -> int:
     _, day_key = _keys(user_id, int(time.time()))
-    return int(client().get(day_key) or 0)
+    return int(get_store().kv_get(day_key) or 0)
 
-
-# --- worker heartbeat (Render workers have no HTTP health check) ---
 
 def heartbeat() -> None:
-    client().set("worker:heartbeat", str(int(time.time())), ex=60)
+    get_store().worker_heartbeat = time.time()
+
+
+def last_heartbeat() -> float:
+    return get_store().worker_heartbeat
+
+
+# users / bans / request log (formerly Postgres)
+
+def upsert_user(telegram_id: int, username: str | None) -> None:
+    get_store().upsert_user(telegram_id, username)
+
+
+def is_banned(telegram_id: int) -> bool:
+    return get_store().is_banned(telegram_id)
+
+
+def set_banned(telegram_id: int, banned: bool) -> None:
+    get_store().set_banned(telegram_id, banned)
+
+
+def audit(admin_id: int, action: str, target_id: int | None) -> None:
+    get_store().audit(admin_id, action, target_id)
+
+
+def create_request(telegram_id: int, url: str, platform: str, fmt: str, source: str = "chat") -> str:
+    return get_store().create_request(telegram_id, url, platform, fmt, source)
+
+
+def finish_request(request_id: str, status: str, error_code: str | None = None,
+                   file_size: int | None = None, duration_ms: int | None = None,
+                   title: str | None = None) -> None:
+    get_store().finish_request(request_id, status, error_code, file_size, duration_ms, title)
+
+
+def get_request(request_id: str, telegram_id: int) -> dict | None:
+    return get_store().get_request(request_id, telegram_id)
+
+
+def recent_requests(telegram_id: int, limit: int = 20) -> list[dict]:
+    return get_store().recent_requests(telegram_id, limit)
+
+
+def stats() -> dict:
+    return get_store().stats()

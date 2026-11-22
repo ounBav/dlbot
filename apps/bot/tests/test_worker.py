@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import db, store, worker
+from app import store, worker
 from app.downloader import DownloadError, DownloadResult
 
 
@@ -15,8 +15,7 @@ def run(monkeypatch, tmp_path):
     monkeypatch.setattr(store, "set_progress", lambda rid, **f: stages.append(f))
     monkeypatch.setattr(store, "is_cancelled", lambda token: False)
     monkeypatch.setattr(store, "cache_set", lambda *a: None)
-    monkeypatch.setattr(db, "save_media_cache", lambda *a: None)
-    monkeypatch.setattr(db, "finish_request", lambda rid, status, **kw: finished.append((status, kw)))
+    monkeypatch.setattr(store, "finish_request", lambda rid, status, **kw: finished.append((status, kw)))
 
     tg = SimpleNamespace(edit_message=lambda *a: None, send_file=lambda *a: "FID")
     job = {"token": "t", "db_id": "00000000-0000-0000-0000-000000000001", "fmt": "video",

@@ -3,7 +3,7 @@
 import logging
 import secrets
 
-from . import db, jobs, messages, store
+from . import jobs, messages, store
 from .config import get_settings
 from .tg import TelegramClient
 from .url_utils import PLATFORM_LABELS, detect_platform, extract_url
@@ -32,8 +32,8 @@ def _handle_message(msg: dict, tg: TelegramClient) -> None:
     if chat.get("type") != "private" or not user_id or not text or chat_id is None:
         return
 
-    db.upsert_user(user_id, sender.get("username"))
-    if db.is_banned(user_id):
+    store.upsert_user(user_id, sender.get("username"))
+    if store.is_banned(user_id):
         tg.send_message(chat_id, messages.BANNED)
         return
 
@@ -106,11 +106,11 @@ def _handle_admin(args: list[str], chat_id: int, user_id: int, tg: TelegramClien
 
     action = args[0].lower() if args else "stats"
     if action == "stats" and len(args) <= 1:
-        tg.send_message(chat_id, messages.admin_stats(db.stats()))
+        tg.send_message(chat_id, messages.admin_stats(store.stats()))
     elif action in ("ban", "unban") and len(args) == 2 and args[1].isdigit():
         target = int(args[1])
-        db.set_banned(target, action == "ban")
-        db.audit(user_id, action, target)
+        store.set_banned(target, action == "ban")
+        store.audit(user_id, action, target)
         log.info("admin action", extra={"user_id": target})
         tg.send_message(chat_id, messages.admin_done(action, target))
     else:
@@ -135,7 +135,7 @@ def _handle_callback(cq: dict, tg: TelegramClient) -> None:
     if req is None:
         tg.edit_message(chat_id, message_id, messages.EXPIRED)
         return
-    if req["user_id"] != user_id or db.is_banned(user_id):
+    if req["user_id"] != user_id or store.is_banned(user_id):
         return  # someone else tapping the button, or banned user
     if not store.claim(token, fmt):
         return  # duplicate tap on the same format
