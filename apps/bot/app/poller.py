@@ -22,6 +22,9 @@ log = logging.getLogger("poller")
 
 ALLOWED_UPDATES = ["message", "callback_query"]
 MAX_BACKOFF = 60.0
+# If the loop itself crashes (a bug, not a Telegram/network error), restart it after these delays.
+RESTART_DELAYS = (5.0, 10.0, 30.0, 60.0)
+HEALTHY_RUN_SEC = 300.0     # a run that lasted this long resets the restart backoff
 
 
 class Poller:
@@ -30,6 +33,9 @@ class Poller:
         self.poll_timeout = poll_timeout
         self.offset: int | None = None
         self.last_ok: float | None = None    # time.monotonic() of the last successful getUpdates
+        self.last_update_at: float | None = None  # time.time() of the last update received (/health)
+        self.restarts = 0
+        self._crashed = False                # True while waiting to restart after a crash
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._backoff = 1.0
@@ -37,7 +43,7 @@ class Poller:
     # --- lifecycle ---
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self.run, name="poller", daemon=True)
+        self._thread = threading.Thread(target=self._supervise, name="poller", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float = 5) -> None:
@@ -48,7 +54,27 @@ class Poller:
             self._thread.join(timeout)
 
     def alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return self._thread is not None and self._thread.is_alive() and not self._crashed
+
+    def _supervise(self) -> None:
+        """Run the loop; if it raises, log and restart it with backoff (5 s, 10 s, 30 s, 60 s max)."""
+        attempt = 0
+        while not self._stop.is_set():
+            started = time.monotonic()
+            self._crashed = False
+            try:
+                self.run()
+                return                      # run() only returns once stop() was called
+            except Exception:
+                if time.monotonic() - started >= HEALTHY_RUN_SEC:
+                    attempt = 0
+                delay = RESTART_DELAYS[min(attempt, len(RESTART_DELAYS) - 1)]
+                attempt += 1
+                self.restarts += 1
+                self._crashed = True
+                log.exception("polling crashed, restarting in %.0f s", delay,
+                              extra={"code": "E-POLLER"})
+                self._stop.wait(delay)
 
     # --- loop ---
 
@@ -80,6 +106,8 @@ class Poller:
 
         self._backoff = 1.0
         self.last_ok = time.monotonic()
+        if updates:
+            self.last_update_at = time.time()
         for update in updates:
             update_id = update.get("update_id")
             if isinstance(update_id, int):

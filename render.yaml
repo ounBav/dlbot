@@ -3,7 +3,8 @@
 # No Postgres, no Redis: state is an in-memory singleton (apps/bot/app/store.py), so the bot
 # service must run as a single instance with a single process. A redeploy/restart clears the
 # queue, bans, stats and the file_id cache (accepted for v1).
-# Updates are pulled with getUpdates (no webhook), so the plan must not sleep when idle (no free plan).
+# Updates are pulled with getUpdates (no webhook). The free plan sleeps after 15 idle minutes, so an
+# external pinger must call /health every 10 minutes (README "Keep-alive on Render").
 # Render builds the root Dockerfile on every push to main (autoDeploy).
 services:
   - type: web
@@ -11,7 +12,7 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    plan: starter
+    plan: free               # needs the external /health pinger, or the bot stops answering
     numInstances: 1          # in-memory state + one getUpdates consumer per token: never scale out
     healthCheckPath: /health
     autoDeploy: true
@@ -34,6 +35,9 @@ services:
         value: "86400"
       - key: POLL_TIMEOUT
         value: "25"
+      # Self-ping RENDER_EXTERNAL_URL/health. Does not replace the external pinger (README keep-alive).
+      - key: KEEPALIVE_SELF_PING
+        value: "false"
       - key: MAX_UPLOAD_MB
         value: "50"
       - key: RATE_PER_MINUTE
