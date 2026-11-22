@@ -1,27 +1,24 @@
-"""Background worker: dequeues download jobs, downloads, uploads to Telegram, cleans up."""
+"""In-process download workers: dequeue jobs, download, upload to Telegram, clean up.
+
+Runs as daemon threads inside the web process (started by app/main.py), because the job queue is
+an in-memory singleton (app/store.py) that only this process can see.
+Each job downloads into its own folder under TEMP_DIR; the folder is removed in `finally`.
+"""
 
 import logging
 import os
 import shutil
-import signal
 import tempfile
+import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-from . import db, messages, store
+from . import messages, store
 from .config import get_settings
 from .downloader import DownloadError, download
-from .log import setup_logging
 from .tg import TelegramClient, TelegramError
 from .url_utils import PLATFORM_LABELS, url_hash
 
 log = logging.getLogger("worker")
-_running = True
-
-
-def _stop(*_):
-    global _running
-    _running = False
 
 
 def process(job: dict, tg: TelegramClient) -> None:
@@ -53,8 +50,7 @@ def process(job: dict, tg: TelegramClient) -> None:
 
         h = url_hash(job["url"])
         store.cache_set(h, fmt, file_id)
-        db.save_media_cache(h, fmt, file_id, result.title, result.size)
-        db.finish_request(db_id, "done", file_size=result.size, title=result.title,
+        store.finish_request(db_id, "done", file_size=result.size, title=result.title,
                           duration_ms=int((time.monotonic() - started) * 1000))
         _progress(db_id, stage="done")
         tg.edit_message(chat_id, message_id, messages.DONE)
@@ -100,7 +96,7 @@ def _safe_edit(tg: TelegramClient, chat_id: int, message_id: int, text: str) -> 
 
 
 def _finish_cancelled(job: dict, tg: TelegramClient) -> None:
-    db.finish_request(job["db_id"], "cancelled")
+    store.finish_request(job["db_id"], "cancelled")
     _progress(job["db_id"], stage="cancelled")
     _safe_edit(tg, job["chat_id"], job["message_id"], messages.CANCELLED)
 
@@ -110,7 +106,7 @@ def _fail(job: dict, code: str, tg: TelegramClient, extra: dict, detail: str = "
     log.error("job failed", extra={**extra, "code": code})
     if detail:
         log.error("failure detail: %s", detail[:500], extra=extra)
-    db.finish_request(job["db_id"], "failed", error_code=code)
+    store.finish_request(job["db_id"], "failed", error_code=code)
     _progress(job["db_id"], stage="failed", error_code=code)
     text = messages.error(code, ref=job["db_id"][:8], limit_mb=s.max_upload_mb)
     _safe_edit(tg, job["chat_id"], job["message_id"], text)
@@ -123,30 +119,46 @@ def _safe_process(job: dict, tg: TelegramClient) -> None:
         log.exception("job crashed outside handler")
 
 
-def main() -> None:
-    setup_logging()
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
-
-    s = get_settings()
-    tg = TelegramClient(s.bot_token)
-    pool = ThreadPoolExecutor(max_workers=s.worker_concurrency)
-    inflight: set = set()
-    log.info("worker started", extra={"code": f"concurrency={s.worker_concurrency}"})
-
-    while _running:
-        store.heartbeat()
-        inflight = {f for f in inflight if not f.done()}
-        if len(inflight) >= s.worker_concurrency:
-            wait(inflight, timeout=1, return_when=FIRST_COMPLETED)
-            continue
-        job = store.dequeue(timeout=5)
-        if job:
-            inflight.add(pool.submit(_safe_process, job, tg))
-
-    log.info("worker stopping, waiting for in-flight jobs")
-    pool.shutdown(wait=True)
+def clean_temp_dir() -> None:
+    """Remove job folders left behind by a crash or a hard restart."""
+    root = get_settings().temp_dir
+    os.makedirs(root, exist_ok=True)
+    for name in os.listdir(root):
+        if name.startswith("job-"):
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
 
 
-if __name__ == "__main__":
-    main()
+class WorkerPool:
+    """N threads pulling jobs from the in-memory queue."""
+
+    def __init__(self, tg: TelegramClient, concurrency: int):
+        self.tg = tg
+        self.concurrency = max(1, concurrency)
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+
+    def start(self) -> None:
+        clean_temp_dir()
+        for i in range(self.concurrency):
+            t = threading.Thread(target=self._loop, name=f"worker-{i}", daemon=True)
+            t.start()
+            self._threads.append(t)
+        log.info("workers started", extra={"code": f"concurrency={self.concurrency}"})
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            store.heartbeat()
+            job = store.dequeue(timeout=1)
+            if job:
+                _safe_process(job, self.tg)
+
+    def alive(self) -> bool:
+        return bool(self._threads) and all(t.is_alive() for t in self._threads)
+
+    def stop(self, timeout: float = 30) -> None:
+        """Stop taking new jobs and wait (bounded) for in-flight ones."""
+        log.info("workers stopping")
+        self._stop.set()
+        deadline = time.monotonic() + timeout
+        for t in self._threads:
+            t.join(max(0.0, deadline - time.monotonic()))

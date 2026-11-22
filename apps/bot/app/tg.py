@@ -6,7 +6,12 @@ import httpx
 
 
 class TelegramError(Exception):
-    pass
+    """Telegram answered `ok: false`. `code` is Telegram's error_code (e.g. 401, 409, 429)."""
+
+    def __init__(self, description: str, code: int | None = None, retry_after: int | None = None):
+        super().__init__(description)
+        self.code = code
+        self.retry_after = retry_after
 
 
 class TelegramClient:
@@ -20,11 +25,26 @@ class TelegramClient:
         except ValueError:
             raise TelegramError(f"HTTP {resp.status_code}")
         if not data.get("ok"):
-            raise TelegramError(data.get("description", "unknown error"))
+            raise TelegramError(data.get("description", "unknown error"), code=data.get("error_code"),
+                                retry_after=(data.get("parameters") or {}).get("retry_after"))
         return data["result"]
 
     def call(self, method: str, **params):
         return self._unwrap(self.http.post(f"{self.base}/{method}", json=params))
+
+    # --- long polling (app/poller.py) ---
+
+    def delete_webhook(self) -> None:
+        """getUpdates is refused (409) while a webhook is set. Pending updates are kept."""
+        self.call("deleteWebhook", drop_pending_updates=False)
+
+    def get_updates(self, offset: int | None, timeout: int, allowed_updates: list[str]) -> list[dict]:
+        params = {"timeout": timeout, "allowed_updates": allowed_updates}
+        if offset is not None:
+            params["offset"] = offset
+        # The HTTP read timeout must outlast Telegram's long-poll hold time.
+        resp = self.http.post(f"{self.base}/getUpdates", json=params, timeout=timeout + 15)
+        return self._unwrap(resp)
 
     def send_message(self, chat_id: int, text: str, reply_markup: dict | None = None):
         params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}

@@ -1,48 +1,35 @@
-"""Webhook API. Runs on Render as a web service. Must answer Telegram fast (NFR-01)."""
+"""The bot process: Telegram long polling + in-process download workers + a small HTTP API.
 
-import asyncio
-import hmac
+One process, one Render web service:
+  - Poller (app/poller.py)     getUpdates loop -> handlers.handle_update (route + enqueue only)
+  - WorkerPool (app/worker.py) download -> send -> delete temp files
+  - FastAPI                    /health and the Mini App API (/api). No webhook endpoint.
+State lives in app/store.py (in memory), so this must run as exactly one process.
+"""
+
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.concurrency import run_in_threadpool
 
-from . import api, db, messages, store
+from . import api, messages, store
 from .config import get_settings
-from .handlers import handle_update
 from .log import setup_logging
+from .poller import Poller
 from .tg import TelegramClient
+from .worker import WorkerPool
 
-log = logging.getLogger("webhook")
+log = logging.getLogger("bot")
 tg_client: TelegramClient | None = None
+workers: WorkerPool | None = None
+poller: Poller | None = None
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global tg_client
+    global tg_client, workers, poller
     setup_logging()
-
-    # Retry migrations with exponential backoff (handles Render db initialization delay)
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            db.run_migrations()
-            break
-        except Exception as e:
-            if attempt == max_retries - 1:
-                # In production, if DB still unavailable, log but don't crash
-                # Health check will fail until database is ready
-                log.error(f"Failed to run migrations after {max_retries} attempts: {e}")
-                log.error("DATABASE NOT READY - Render database may still be initializing")
-                log.error("Check: Render Dashboard → bot-db → Status should be 'Available'")
-                # Don't raise - let the service start (health check will catch it)
-                log.warning("Continuing startup without migrations - database will be initialized on next restart")
-                break
-            wait_time = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
-            log.warning(f"Migration failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}")
-            await asyncio.sleep(wait_time)
 
     s = get_settings()
     tg_client = TelegramClient(s.bot_token)
@@ -53,7 +40,14 @@ async def lifespan(_: FastAPI):
                                web_app_label=messages.MENU_BUTTON)
     except Exception:
         log.exception("could not register bot commands")  # never block startup on this
+
+    workers = WorkerPool(tg_client, s.worker_concurrency)
+    workers.start()
+    poller = Poller(tg_client, s.poll_timeout)
+    poller.start()
     yield
+    poller.stop()       # stop taking new updates first
+    workers.stop()      # then let in-flight downloads finish (bounded)
     tg_client.http.close()
 
 
@@ -73,30 +67,9 @@ app.include_router(api.router)
 
 @app.get("/health")
 def health():
-    try:
-        store.ping()
-    except Exception:
-        raise HTTPException(status_code=503, detail="redis unavailable")
-    return {"status": "ok"}
-
-
-@app.post("/telegram/webhook")
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token: str | None = Header(default=None),
-):
-    # NFR-05: reject requests that do not carry Telegram's secret token
-    if not hmac.compare_digest(x_telegram_bot_api_secret_token or "", get_settings().webhook_secret):
-        raise HTTPException(status_code=403)
-
-    update = await request.json()
-    update_id = update.get("update_id")
-    if update_id is not None and not store.dedupe_update(update_id):
-        return {"ok": True}  # already processed; Telegram retried
-
-    try:
-        await run_in_threadpool(handle_update, update, tg_client)
-    except Exception:
-        # Always return 200 so Telegram does not retry in a storm; the error is logged.
-        log.exception("update handling failed")
-    return {"ok": True}
+    if workers is not None and not workers.alive():
+        raise HTTPException(status_code=503, detail="workers stopped")
+    if poller is not None and not poller.alive():
+        raise HTTPException(status_code=503, detail="poller stopped")
+    return {"status": "ok", "queued": store.get_store().queue_size(),
+            "polling": poller is not None and poller.last_ok is not None}
