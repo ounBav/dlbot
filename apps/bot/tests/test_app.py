@@ -127,7 +127,7 @@ def test_link_to_file_end_to_end_and_temp_is_removed(bot, monkeypatch):
     _, tg, tmp_path = bot
     seen_dirs = []
 
-    def fake_download(url, fmt, out_dir, max_bytes):
+    def fake_download(url, fmt, out_dir, max_bytes, **kw):
         seen_dirs.append(out_dir)
         path = os.path.join(out_dir, "media.mp4")
         with open(path, "wb") as fh:
@@ -152,7 +152,7 @@ def test_failed_job_retries_then_fails_and_cleans_up(bot, monkeypatch):
     _, tg, tmp_path = bot
     calls = []
 
-    def flaky(url, fmt, out_dir, max_bytes):
+    def flaky(url, fmt, out_dir, max_bytes, **kw):
         calls.append(out_dir)
         open(os.path.join(out_dir, "media.part"), "wb").close()
         raise DownloadError("E-FAILED", "network")
@@ -176,3 +176,49 @@ def test_startup_removes_leftover_job_folders(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "get_settings", lambda: SimpleNamespace(temp_dir=str(tmp_path)))
     worker.clean_temp_dir()
     assert sorted(os.listdir(tmp_path)) == ["keep.txt"]
+
+
+def test_mini_app_save_to_device_end_to_end(bot, monkeypatch):
+    """Real lifespan, worker thread and store: submit -> progress -> file link -> expiry -> deleted."""
+    from app import api
+    from .test_webapp_auth import make_init_data
+
+    client, tg, tmp_path = bot
+    settings = main.get_settings()
+    monkeypatch.setattr(api, "get_settings", lambda: settings)
+    auth = {"Authorization": "tma " + make_init_data(token=settings.bot_token, auth_date=int(time.time()),
+                                                     user={"id": 77, "first_name": "Ann"})}
+    seen = {}
+
+    def fake_download(url, fmt, out_dir, max_bytes, **kw):
+        seen.update(kw)
+        kw["on_progress"]("downloading", 0.5)
+        path = os.path.join(out_dir, "media.mp4")
+        with open(path, "wb") as fh:
+            fh.write(b"video-bytes")
+        return DownloadResult(path=path, title="Clip / one", duration=3, size=11)
+
+    monkeypatch.setattr(worker, "download", fake_download)
+    resp = client.post("/api/downloads", headers=auth,
+                       json={"url": "https://youtu.be/abc", "format": "video", "quality": 720, "delivery": "device"})
+    assert resp.status_code == 200
+    job_id = resp.json()["id"]
+
+    assert wait_for(lambda: client.get(f"/api/downloads/{job_id}", headers=auth).json()["status"] == "done")
+    body = client.get(f"/api/downloads/{job_id}", headers=auth).json()
+    assert seen["quality"] == 720 and body["delivery"] == "device"
+    assert body["file"]["name"] == "Clip one.mp4" and body["file"]["size"] == 11
+    assert tg.sent == [] and tg.files == []                      # nothing went through the chat
+
+    link = body["file"]["download_path"]
+    got = client.get(link)                                       # no initData needed
+    assert got.status_code == 200 and got.content == b"video-bytes"
+    assert got.headers["content-disposition"].startswith("attachment")
+
+    # Link expires -> 410, and the janitor sweep deletes the folder.
+    token = link.rsplit("/", 1)[1]
+    store.get_store()._files[token] = (time.time() - 1, store.get_store()._files[token][1])
+    assert client.get(link).status_code == 410
+    assert worker.sweep_files() == 1
+    assert wait_for(lambda: os.listdir(tmp_path) == [])
+    assert client.get(f"/api/downloads/{job_id}", headers=auth).json()["file"] is None
