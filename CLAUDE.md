@@ -2,7 +2,7 @@
 
 Telegram bot: user sends a public TikTok, YouTube or Facebook link → bot offers 🎬 Video / 🎵 Audio → bot downloads with yt-dlp and sends the file back. No media is stored after delivery.
 Mini App: same pipeline, plus preview, quality pick and "Save to device": the finished file is served from `/api/files/<token>` (random 32-byte token) for `FILE_TTL_MIN` (15 min), then deleted (owner decision, 2026-11-22).
-Mini App "TikTok profile" tab: enter `@username`, list the last 10/50/100/all (cap `PROFILE_MAX_VIDEOS`) public videos with yt-dlp flat extraction (no download), pick up to `PROFILE_MAX_SEND`, and the bot sends them to the chat. The listing is one-time, in memory only: dropped on send, new search, Back, app close (`pagehide` → discard), after `PROFILE_SCAN_TTL_MIN`, or on restart (owner decision, 2026-11-22; this is the one approved exception to "no playlists/channels").
+Mini App "TikTok profile" tab: enter `@username`, list the last 10/50/100/all (cap `PROFILE_MAX_VIDEOS`) public videos with yt-dlp flat extraction (no download), pick videos (or **Select all**, up to `PROFILE_MAX_SEND`, default 200), and the bot sends them to the chat. The selection becomes one in-memory batch (`app/batches.py`) fed to the worker queue in waves of `PROFILE_BATCH_SIZE` (default 10): the next wave starts only when every video of the current one is final (dispatcher thread in `WorkerPool`). One running batch per user (`E-BUSY` with its id); cancel drops unreleased videos and refunds their quota. The listing is one-time, in memory only: dropped on send, new search, Back, app close (`pagehide` → discard), after `PROFILE_SCAN_TTL_MIN`, or on restart (owner decision, 2026-11-22; this is the one approved exception to "no playlists/channels").
 
 This file is the source of truth for Claude Code. Read it fully before changing code.
 
@@ -61,6 +61,7 @@ queue ──get──▶ WorkerPool threads (app/worker.py, same process)
 | `app/log.py` | JSON logging. Pass `extra={"req_id", "user_id", "platform", "code"}`. |
 | `app/api.py` | Mini App HTTP API under `/api` (me, info preview, create/list/get/cancel downloads, `files/<token>`). Read-only on polls. |
 | `app/profiles.py` | TikTok profile listing (flat yt-dlp, `tiktok:user`): username parsing, URL built server-side (SSRF), error codes. Needs `curl-cffi`. |
+| `app/batches.py` | TikTok profile batches: whole selection kept in the store, released to the queue `PROFILE_BATCH_SIZE` at a time; `tick()` run by the dispatcher thread; view/cancel for `/api/tiktok/batches/*` |
 | `app/jobs.py` | `submit()`: cache hit or enqueue. Shared by chat callbacks and the Mini App API. |
 | `app/webapp_auth.py` | Validates Mini App `initData` (HMAC with the bot token, `auth_date` max age) |
 

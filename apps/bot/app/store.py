@@ -90,6 +90,7 @@ class MemoryStore:
         self._files: dict[str, tuple[float, dict]] = {}   # Mini App "save to device" tokens
         self._windows: dict[str, deque] = {}               # sliding-window rate limits
         self._scans: dict[int, tuple[float, dict]] = {}    # TikTok profile listing, one per user
+        self._batches: dict[str, tuple[float, dict]] = {}  # TikTok profile batches (app/batches.py)
         self._last_sweep = 0.0
         self.worker_heartbeat = 0.0
 
@@ -102,6 +103,8 @@ class MemoryStore:
                 del self._progress[key]
             for uid in [k for k, (exp, _) in self._scans.items() if exp <= now]:
                 del self._scans[uid]
+            for bid in [k for k, (exp, _) in self._batches.items() if exp <= now]:
+                del self._batches[bid]
         return now
 
     # --- generic key/value with TTL ---
@@ -208,6 +211,32 @@ class MemoryStore:
     def scan_count(self) -> int:
         with self._lock:
             return len(self._scans)
+
+    # --- TikTok profile batches (logic in app/batches.py; mutated only through batch_txn) ---
+
+    def put_batch(self, batch_id: str, batch: dict, ttl: float) -> None:
+        with self._lock:
+            self._batches[batch_id] = (self._now() + ttl, batch)
+
+    def batch_txn(self, batch_id: str, fn):
+        """Run fn(batch) under the store lock. None if the batch is unknown or expired."""
+        with self._lock:
+            item = self._batches.get(batch_id)
+            if item is None or item[0] <= self._now():
+                self._batches.pop(batch_id, None)
+                return None
+            return fn(item[1])
+
+    def touch_batch(self, batch_id: str, ttl: float) -> None:
+        with self._lock:
+            item = self._batches.get(batch_id)
+            if item is not None:
+                self._batches[batch_id] = (self._now() + ttl, item[1])
+
+    def batch_ids(self) -> list[str]:
+        with self._lock:
+            now = self._now()
+            return [k for k, (exp, _) in self._batches.items() if exp > now]
 
     # --- sliding-window rate limit ---
 
@@ -427,6 +456,22 @@ def get_scan(user_id: int) -> dict | None:
 
 def drop_scan(user_id: int, scan_id: str | None = None) -> bool:
     return get_store().drop_scan(user_id, scan_id)
+
+
+def put_batch(batch_id: str, batch: dict, ttl: float) -> None:
+    get_store().put_batch(batch_id, batch, ttl)
+
+
+def batch_txn(batch_id: str, fn):
+    return get_store().batch_txn(batch_id, fn)
+
+
+def touch_batch(batch_id: str, ttl: float) -> None:
+    get_store().touch_batch(batch_id, ttl)
+
+
+def batch_ids() -> list[str]:
+    return get_store().batch_ids()
 
 
 def hit_window(key: str, limit: int, window: float) -> tuple[bool, int]:

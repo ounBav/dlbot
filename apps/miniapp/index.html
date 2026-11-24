@@ -13,10 +13,10 @@
   <title>Media Downloader</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%232481cc' d='M12 3v10.6l3.3-3.3 1.4 1.4L12 16.4l-4.7-4.7 1.4-1.4 3.3 3.3V3zM5 19h14v2H5z'/%3E%3C/svg%3E">
   <!-- ?v= busts Telegram's webview cache after a deploy; bump together with the imports in src/app.js. -->
-  <link rel="stylesheet" href="styles.css?v=2">
+  <link rel="stylesheet" href="styles.css?v=3">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="config.js?v=2"></script>
-  <script type="module" src="src/app.js?v=2"></script>
+  <script src="config.js?v=3"></script>
+  <script type="module" src="src/app.js?v=3"></script>
 </head>
 <body>
   <!-- Full-screen states: loading, opened outside Telegram, expired session, banned. -->
@@ -60,6 +60,15 @@
           <span class="badge-row" id="platform-row"></span>
         </div>
       </form>
+
+      <button type="button" class="card entry" id="profile-entry">
+        <span class="pf tiktok" aria-hidden="true" id="profile-entry-mark"></span>
+        <span class="entry-text">
+          <span class="entry-title" data-s="profileEntry"></span>
+          <span class="entry-sub" data-s="profileEntryHint"></span>
+        </span>
+        <svg class="entry-chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M9.4 6 8 7.4l4.6 4.6L8 16.6 9.4 18l6-6z"/></svg>
+      </button>
 
       <section class="history" aria-labelledby="history-title">
         <div class="section-head">
@@ -155,6 +164,57 @@
       <h1 class="title" id="error-title" data-s="errorTitle"></h1>
       <p class="lede" id="error-body" role="alert"></p>
       <div class="actions" id="error-actions"></div>
+    </section>
+
+    <!-- 6. TikTok profile: search, then pick videos (Select all) -->
+    <section class="screen" id="screen-profile" aria-labelledby="profile-title" hidden>
+      <header class="top">
+        <div class="top-text">
+          <h1 class="title" id="profile-title" data-s="profileTitle"></h1>
+          <p class="lede" data-s="profileLede"></p>
+        </div>
+      </header>
+
+      <form class="card" id="profile-form" novalidate>
+        <label class="label" for="username" data-s="usernameLabel"></label>
+        <div class="field">
+          <input id="username" name="username" type="text" autocomplete="off" autocapitalize="off"
+                 autocorrect="off" spellcheck="false" enterkeyhint="search" maxlength="200"
+                 data-s-placeholder="usernamePlaceholder">
+        </div>
+        <p class="label" id="limit-label" data-s="howMany"></p>
+        <div class="chips" role="radiogroup" aria-labelledby="limit-label" id="limit-chips">
+          <button type="button" role="radio" class="chip" data-limit="10">10</button>
+          <button type="button" role="radio" class="chip" data-limit="50">50</button>
+          <button type="button" role="radio" class="chip" data-limit="100">100</button>
+          <button type="button" role="radio" class="chip" data-limit="all" data-s="limitAll"></button>
+        </div>
+        <p class="hint" id="profile-hint" role="status" aria-live="polite"></p>
+      </form>
+
+      <section id="profile-results" aria-labelledby="results-title" hidden>
+        <div class="section-head">
+          <h2 class="section-title" id="results-title"></h2>
+          <button type="button" class="link-btn" id="select-all" aria-pressed="false" data-s="selectAll"></button>
+        </div>
+        <p class="hint pick-hint" id="pick-hint" role="status" aria-live="polite"></p>
+        <ul class="history-list card flush" id="video-list"></ul>
+      </section>
+    </section>
+
+    <!-- 7. Batch progress: the selection is sent in groups (waves) of PROFILE_BATCH_SIZE -->
+    <section class="screen" id="screen-batch" aria-labelledby="batch-title" hidden>
+      <div class="card progress-card">
+        <h1 class="mini-title" id="batch-title"></h1>
+        <p class="stage" id="batch-stage" role="status" aria-live="polite"></p>
+        <div class="bar" id="batch-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-labelledby="batch-stage">
+          <span class="bar-fill" id="batch-bar-fill"></span>
+        </div>
+        <p class="hint" id="batch-counts"></p>
+        <p class="hint" id="batch-note"></p>
+      </div>
+      <ul class="history-list card flush" id="batch-list"></ul>
+      <button type="button" class="btn text danger block" id="batch-cancel" data-s="cancelBatch"></button>
     </section>
 
     <!-- In-page action button: used only when Telegram's MainButton is unavailable. -->

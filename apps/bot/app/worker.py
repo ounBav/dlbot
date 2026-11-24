@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 
-from . import messages, store
+from . import batches, messages, store
 from .config import get_settings
 from .downloader import DownloadError, download
 from .jobs import cache_key
@@ -207,9 +207,10 @@ class WorkerPool:
             t = threading.Thread(target=self._loop, name=f"worker-{i}", daemon=True)
             t.start()
             self._threads.append(t)
-        t = threading.Thread(target=self._janitor, name="janitor", daemon=True)
-        t.start()
-        self._threads.append(t)
+        for target, name in ((self._janitor, "janitor"), (self._dispatcher, "batch-dispatcher")):
+            t = threading.Thread(target=target, name=name, daemon=True)
+            t.start()
+            self._threads.append(t)
         log.info("workers started", extra={"code": f"concurrency={self.concurrency}"})
 
     def _loop(self) -> None:
@@ -226,6 +227,11 @@ class WorkerPool:
                     log.info("expired files removed")
             except Exception:
                 log.exception("file sweep failed")
+
+    def _dispatcher(self) -> None:
+        """Feed TikTok profile batches to the queue, PROFILE_BATCH_SIZE videos per wave."""
+        while not self._stop.wait(1):
+            batches.tick(self.tg)   # never raises: errors are logged per batch
 
     def alive(self) -> bool:
         return bool(self._threads) and all(t.is_alive() for t in self._threads)

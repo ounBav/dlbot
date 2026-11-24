@@ -3,6 +3,8 @@
 Telegram Mini App for the media downloader bot. Flow: **home** (paste a link) → **preview**
 (thumbnail, title, Video/Audio, quality, delivery) → **progress** (live percentage, cancel) →
 **ready** (save the file) or **error** (specific message plus the next step).
+TikTok profile: **profile** (username, how many, pick videos or **Select all**) → **batch** (groups of
+10 sent one after another, per-video status, Stop sending). The batch keeps running if the app closes.
 
 Two deliveries:
 - **This device** (default): the worker keeps the finished file for `FILE_TTL_MIN` (15 min) behind
@@ -36,6 +38,11 @@ Mini App ── GET  /api/me ──────────────▶ user,
          ── GET  /api/downloads/{id} ──▶ status, progress 0-1, file {name, size, download_path, expires_at}
          ── POST /api/downloads/{id}/cancel
          ── GET  /api/downloads ───────▶ recent downloads (home screen)
+         ── POST /api/tiktok/scan ─────▶ {username, limit 10|50|100|"all"} → one-time listing
+         ── POST /api/tiktok/scan/{id}/send ▶ {video_ids} → batch (sent in groups of PROFILE_BATCH_SIZE)
+                                         (409 E-BUSY with the running batch id: one batch per user)
+         ── GET  /api/tiktok/batches/{id} ──▶ per-video status, current group, counts
+         ── POST /api/tiktok/batches/{id}/cancel · POST /api/tiktok/scan/discard (pagehide, keepalive)
 Telegram ── GET  /api/files/{token} ───▶ the file (attachment; token instead of initData; 410 when expired)
 ```
 

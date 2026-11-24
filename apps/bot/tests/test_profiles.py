@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from yt_dlp.utils import DownloadError as YtdlpDownloadError
 
-from app import api, jobs, messages, profiles, store, worker
+from app import api, batches, jobs, messages, profiles, store, worker
 from app.config import Settings
 from app.downloader import DownloadError
 from app.tg import TelegramError
@@ -299,7 +299,9 @@ def test_send_uses_the_file_id_cache(client, monkeypatch):
     monkeypatch.setattr(store, "cache_get", lambda h, fmt: "FILEID")
     body = c.post(f"/api/tiktok/scan/{data['scan_id']}/send",
                   json={"video_ids": [data["videos"][0]["id"]]}).json()
-    assert body["items"][0] == {"video_id": data["videos"][0]["id"], "id": None, "status": "done"}
+    item = body["items"][0]
+    assert (item["video_id"], item["id"], item["status"]) == (data["videos"][0]["id"], None, "done")
+    assert body["state"] == "done" and body["done"] == 1
     assert tg.cached == [(USER_ID, "video", "FILEID")]
 
 
@@ -378,3 +380,148 @@ def test_failed_device_job_sends_nothing(monkeypatch):
     worker._fail({"db_id": "x" * 12, "chat_id": None, "message_id": None, "user_id": 5,
                   "delivery": "device"}, "E-FAILED", tg, extra={})
     assert tg.sent == []
+
+
+# --------------------------------------------------------------------------- batch queue (waves)
+
+@pytest.fixture
+def big(monkeypatch):
+    """A 25-video listing, waves of 10, quota large enough for "Select all"."""
+    store.reset()
+    settings = Settings(_env_file=None, bot_token=TOKEN, rate_per_day=100, profile_max_videos=40,
+                        profile_batch_size=10)
+    monkeypatch.setattr(api, "get_settings", lambda: settings)
+    monkeypatch.setattr(profiles, "scan", lambda username, limit, attempts=2: profiles.ProfileScan(
+        username=username, nickname="", videos=[profiles._video(entry(i), username) for i in range(25)]))
+    tg = FakeTg()
+    app = FastAPI()
+    app.include_router(api.router)
+    app.dependency_overrides[api.get_tg] = lambda: tg
+    c = TestClient(app)
+    c.headers["Authorization"] = (
+        f"tma {make_init_data(auth_date=int(time.time()), user={'id': USER_ID, 'first_name': 'Ann'})}")
+    data = scan(c, limit="all").json()
+    return c, tg, data
+
+
+def drain():
+    jobs_ = []
+    while (j := store.dequeue(0)) is not None:
+        jobs_.append(j)
+    return jobs_
+
+
+def finish(job, status="done"):
+    store.finish_request(job["db_id"], status)
+    store.set_progress(job["db_id"], stage=status)
+
+
+def send_all(c, data):
+    return c.post(f"/api/tiktok/scan/{data['scan_id']}/send",
+                  json={"video_ids": [v["id"] for v in data["videos"]]})
+
+
+def test_select_all_queues_the_first_wave_only(big):
+    c, tg, data = big
+    assert data["max_send"] == 40 and data["batch_size"] == 10
+    r = send_all(c, data)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 25 and body["waves"] == 3 and body["wave"] == 1 and body["queued"] == 10
+    assert body["waiting"] == 15 and body["state"] == "running"
+    assert [i["wave"] for i in body["items"]] == [1] * 10 + [2] * 10 + [3] * 5
+    assert tg.sent == [(USER_ID, messages.from_profile(25, "abc"))]   # one message for the batch
+    assert store.usage_today(USER_ID) == 25
+    assert len(drain()) == 10
+
+
+def test_next_wave_starts_only_when_the_current_one_is_over(big):
+    c, tg, data = big
+    batch_id = send_all(c, data).json()["id"]
+    wave1 = drain()
+    for j in wave1[:9]:
+        finish(j)
+    assert batches.tick(tg) == 0 and drain() == []           # one video still running
+    finish(wave1[9], "failed")
+    assert batches.tick(tg) == 10
+    wave2 = drain()
+    assert [j["url"] for j in wave2] == [v["url"] for v in data["videos"][10:20]]
+    assert batches.tick(tg) == 0                               # never released twice
+    for j in wave2:
+        finish(j)
+    assert batches.tick(tg) == 5
+    for j in drain():
+        finish(j)
+    view = c.get(f"/api/tiktok/batches/{batch_id}").json()
+    assert view["state"] == "done" and view["done"] == 24 and view["failed"] == 1 and view["wave"] == 3
+
+
+def test_cancel_drops_waiting_videos_refunds_them_and_flags_running_ones(big):
+    c, tg, data = big
+    batch_id = send_all(c, data).json()["id"]
+    wave1 = drain()
+    view = c.post(f"/api/tiktok/batches/{batch_id}/cancel").json()
+    assert view["cancelled"] == 15 and view["state"] == "running"   # wave 1 still has to stop
+    assert store.usage_today(USER_ID) == 10                            # 15 never-started refunded
+    assert all(store.is_cancelled(j["token"]) for j in wave1)
+    for j in wave1:
+        finish(j, "cancelled")
+    assert batches.tick(tg) == 0 and drain() == []
+    assert c.get(f"/api/tiktok/batches/{batch_id}").json()["state"] == "cancelled"
+    c.post(f"/api/tiktok/batches/{batch_id}/cancel")                  # idempotent: no double refund
+    assert store.usage_today(USER_ID) == 10
+
+
+def test_one_running_batch_per_user(big):
+    c, _, data = big
+    first = send_all(c, data).json()["id"]
+    again = scan(c, limit="all").json()
+    r = send_all(c, again)
+    assert r.status_code == 409 and r.json()["detail"] == {"code": "E-BUSY", "id": first}
+    assert store.usage_today(USER_ID) == 25                            # nothing reserved
+
+
+def test_a_lost_job_does_not_block_the_batch(big):
+    c, tg, data = big
+    send_all(c, data)
+    for j in drain():
+        store.get_store()._progress.pop(j["db_id"])                   # progress expired, row not final
+    assert batches.tick(tg) == 10
+
+
+def test_batches_are_private(big):
+    c, _, data = big
+    batch_id = send_all(c, data).json()["id"]
+    assert batches.view(batch_id, 999) is None and batches.cancel(batch_id, 999) is None
+    assert c.get("/api/tiktok/batches/nope").status_code == 404
+    assert c.post("/api/tiktok/batches/nope/cancel").status_code == 404
+
+
+def test_dispatcher_errors_do_not_stop_other_batches(big, monkeypatch):
+    _, tg, _ = big
+    store.put_batch("a", {}, 60)
+    store.put_batch("b", {}, 60)
+    calls = []
+
+    def flaky(tg_, batch_id):
+        calls.append(batch_id)
+        if batch_id == "a":
+            raise RuntimeError("boom")
+        return 3
+
+    monkeypatch.setattr(batches, "release", flaky)
+    assert batches.tick(tg) == 3 and calls == ["a", "b"]
+
+
+def test_worker_pool_runs_the_batch_dispatcher(monkeypatch):
+    import threading
+    ticked = threading.Event()
+    monkeypatch.setattr(worker.batches, "tick", lambda tg: ticked.set() or 0)
+    monkeypatch.setattr(worker, "clean_temp_dir", lambda: None)
+    pool = worker.WorkerPool(FakeTg(), concurrency=1)
+    pool.start()
+    try:
+        assert "batch-dispatcher" in [t.name for t in pool._threads]
+        assert ticked.wait(3)
+    finally:
+        pool.stop(timeout=3)

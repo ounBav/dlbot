@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from . import jobs, messages, profiles, store
+from . import batches, jobs, messages, profiles, store
 from .config import get_settings
 from .downloader import QUALITY_LADDER, DownloadError, probe
 from .tg import TelegramClient, TelegramError
@@ -174,6 +174,7 @@ def me(user: dict = Depends(current_user)):
         "file_ttl_min": s.file_ttl_min,
         "profile_max_videos": max(1, s.profile_max_videos),
         "profile_max_send": _max_send(),
+        "profile_batch_size": _batch_size(),
     }
 
 
@@ -290,11 +291,16 @@ def cancel_download(job_id: str, user: dict = Depends(current_user)):
 # The listing is one-time state (store.put_scan, one per user): it is dropped when the videos are
 # sent, when the app closes (POST /tiktok/scan/discard), after PROFILE_SCAN_TTL_MIN, or on restart.
 
-MAX_SEND_HARD = 20   # the UI follows a batch through GET /downloads, which returns the last 20 jobs
+MAX_SEND_HARD = 1000   # request validation only; the real cap is PROFILE_MAX_SEND / PROFILE_MAX_VIDEOS
 
 
 def _max_send() -> int:
-    return max(1, min(get_settings().profile_max_send, MAX_SEND_HARD))
+    s = get_settings()
+    return max(1, min(s.profile_max_send, s.profile_max_videos, MAX_SEND_HARD))
+
+
+def _batch_size() -> int:
+    return max(1, get_settings().profile_batch_size)
 
 
 def _video_view(v: dict) -> dict:
@@ -339,6 +345,7 @@ def scan_profile(body: ScanIn, user: dict = Depends(current_user)):
         # "All" stopped at the server's cap: the profile may have more videos than listed.
         "truncated": body.limit == "all" and len(videos) >= cap,
         "max_send": _max_send(),
+        "batch_size": _batch_size(),
         "expires_at": datetime.fromtimestamp(expires, timezone.utc),
         "videos": videos,
     }
@@ -351,7 +358,11 @@ class SendIn(BaseModel):
 @router.post("/tiktok/scan/{scan_id}/send")
 def send_profile_videos(scan_id: str, body: SendIn, user: dict = Depends(current_user),
                         tg: TelegramClient = Depends(get_tg)):
-    """Queue the picked videos for delivery to the bot chat, then forget the listing (one-time)."""
+    """Queue the picked videos as one batch, then forget the listing (one-time).
+
+    The batch is fed to the workers PROFILE_BATCH_SIZE videos at a time (app/batches.py); this call
+    releases the first wave. Follow it with GET /tiktok/batches/{id}. One running batch per user.
+    """
     user_id = user["id"]
     scan = store.get_scan(user_id)
     if scan is None or scan["id"] != scan_id:
@@ -363,6 +374,9 @@ def send_profile_videos(scan_id: str, body: SendIn, user: dict = Depends(current
     max_send = _max_send()
     if len(picked) > max_send:
         raise _fail(400, "E-TOOMANY", max=max_send)
+    running = batches.active_for(user_id)
+    if running:
+        raise _fail(409, "E-BUSY", id=running)
 
     _remember(user)
     s = get_settings()
@@ -379,24 +393,32 @@ def send_profile_videos(scan_id: str, body: SendIn, user: dict = Depends(current
         store.release_daily(user_id, len(picked))
         raise _fail(409, "E-NOCHAT")
 
-    items = []
-    for video in picked:
-        item = {"video_id": video["id"], "id": None, "status": "queued"}
-        try:
-            db_id = jobs.submit(tg, token=secrets.token_urlsafe(8), user_id=user_id, chat_id=user_id,
-                                message_id=None, url=video["url"], platform="tiktok", fmt="video",
-                                source="profile", delivery="chat", title=video["title"] or None)
-            item.update(id=db_id, status="queued" if db_id else "done")
-        except TelegramError:
-            log.warning("profile batch item failed", extra={"user_id": user_id, "platform": "tiktok"})
-            item["status"] = "failed"
-        items.append(item)
-
+    batch_id = batches.create(user_id, scan["username"], picked, _batch_size())
+    released = batches.release(tg, batch_id)
     store.drop_scan(user_id, scan_id)   # one-time listing: gone once the videos are on their way
     log.info("profile batch queued", extra={"user_id": user_id, "platform": "tiktok",
-                                            "code": f"n={len(items)}"})
-    return {"username": scan["username"], "items": items,
-            "queued": sum(i["status"] == "queued" for i in items)}
+                                            "code": f"n={len(picked)}"})
+    return {**batches.view(batch_id, user_id), "queued": released}
+
+
+def _owned_batch(batch_id: str, user_id: int) -> dict:
+    data = batches.view(batch_id, user_id)
+    if data is None:
+        raise _fail(404, "E-NOTFOUND")
+    return data
+
+
+@router.get("/tiktok/batches/{batch_id}")
+def get_batch(batch_id: str, user: dict = Depends(current_user)):
+    """Live state of a profile batch: per-video status, counts and the current wave. Read-only."""
+    return _owned_batch(batch_id, user["id"])
+
+
+@router.post("/tiktok/batches/{batch_id}/cancel")
+def cancel_batch(batch_id: str, user: dict = Depends(current_user)):
+    """Stop a batch: videos not yet queued are dropped (quota refunded), running ones are cancelled."""
+    _owned_batch(batch_id, user["id"])
+    return batches.cancel(batch_id, user["id"])
 
 
 @router.post("/tiktok/scan/discard")

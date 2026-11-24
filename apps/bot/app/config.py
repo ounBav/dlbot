@@ -49,9 +49,12 @@ class Settings(BaseSettings):
 
     # Mini App "TikTok profile" tab (app/profiles.py). "All" lists at most PROFILE_MAX_VIDEOS.
     profile_max_videos: int = 200
-    # Videos sent to the chat in one batch (capped at 20 in code: the UI tracks them through
-    # GET /api/downloads, which returns the last 20 jobs).
-    profile_max_send: int = 10
+    # Most videos one "Send" may pick (also capped by PROFILE_MAX_VIDEOS): "Select all" sends the
+    # whole listing. They are not queued at once: see PROFILE_BATCH_SIZE.
+    profile_max_send: int = 200
+    # Batch queue (app/batches.py): videos released to the workers per wave. The next wave starts
+    # only when every video of the current one has finished.
+    profile_batch_size: int = 10
     # A listing is one-time: dropped on send/discard, otherwise forgotten after this many minutes.
     profile_scan_ttl_min: int = 15
     profile_scan_rate_per_minute: int = 3

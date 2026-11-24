@@ -3,13 +3,15 @@
 
 const TIMEOUT_MS = 15_000;
 const INFO_TIMEOUT_MS = 40_000;   // the server allows yt-dlp 30 s to read a link
+const SCAN_TIMEOUT_MS = 90_000;   // listing a big profile (with one retry) is slower
 
 export function createApi(baseUrl, initData) {
   const base = (baseUrl || "").replace(/\/+$/, "");
 
-  async function request(method, path, body) {
+  async function request(method, path, body, { keepalive = false } = {}) {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), path === "/info" ? INFO_TIMEOUT_MS : TIMEOUT_MS);
+    const limit = path === "/tiktok/scan" ? SCAN_TIMEOUT_MS : path === "/info" ? INFO_TIMEOUT_MS : TIMEOUT_MS;
+    const timer = setTimeout(() => ctrl.abort(), limit);
     let resp;
     try {
       resp = await fetch(`${base}/api${path}`, {
@@ -20,6 +22,7 @@ export function createApi(baseUrl, initData) {
         },
         body: body ? JSON.stringify(body) : undefined,
         cache: "no-store",
+        keepalive,
         signal: ctrl.signal,
       });
     } catch {
@@ -39,7 +42,10 @@ export function createApi(baseUrl, initData) {
     const detail = data && typeof data.detail === "object" && data.detail ? data.detail : {};
     // 422 = request validation (bad format value); treat like an unsupported link.
     const code = detail.code || (resp.status === 422 ? "E-UNSUPPORTED" : "E-FAILED");
-    throw { code, status: resp.status, retryAfter: Number(detail.retry_after) || 0, id: detail.id ?? null };
+    throw {
+      code, status: resp.status, retryAfter: Number(detail.retry_after) || 0, id: detail.id ?? null,
+      remaining: detail.remaining ?? null, max: detail.max ?? null,
+    };
   }
 
   return {
@@ -54,5 +60,12 @@ export function createApi(baseUrl, initData) {
       ...(opts.delivery ? { delivery: opts.delivery } : {}),
     }),
     cancel: (id) => request("POST", `/downloads/${encodeURIComponent(id)}/cancel`),
+    // TikTok profile tab. limit: 10|50|100|"all".
+    scan: (username, limit) => request("POST", "/tiktok/scan", { username, limit }),
+    send: (scanId, videoIds) => request("POST", `/tiktok/scan/${encodeURIComponent(scanId)}/send`, { video_ids: videoIds }),
+    // keepalive lets the request finish while the app is closing (pagehide).
+    discard: () => request("POST", "/tiktok/scan/discard", undefined, { keepalive: true }),
+    batch: (id) => request("GET", `/tiktok/batches/${encodeURIComponent(id)}`),
+    cancelBatch: (id) => request("POST", `/tiktok/batches/${encodeURIComponent(id)}/cancel`),
   };
 }

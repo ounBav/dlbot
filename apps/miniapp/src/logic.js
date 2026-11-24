@@ -149,3 +149,28 @@ export function jobErrorCode(job) {
   if (job.status === "done" && job.delivery === "device" && !job.file) return "E-GONE";
   return job.error_code || "E-FAILED";
 }
+
+// ---------------------------------------------------------------- TikTok profile batches
+
+/** "@Name", profile links etc. -> what the user typed, trimmed. The server does the real parsing. */
+export function cleanUsername(raw) {
+  return String(raw || "").trim();
+}
+
+/** Toggle "Select all": everything (capped at `max`) unless that is already selected. */
+export function toggleAll(ids, selected, max = Infinity) {
+  const target = ids.slice(0, max);
+  const all = target.length > 0 && target.every((id) => selected.has(id));
+  return all ? new Set() : new Set(target);
+}
+
+/** Number of waves (groups) a batch of `n` videos is split into. */
+export function waveCount(n, size) {
+  return n > 0 ? Math.ceil(n / Math.max(1, size)) : 0;
+}
+
+export function batchPercent(batch) {
+  if (!batch?.total) return 0;
+  const over = (batch.done || 0) + (batch.failed || 0) + (batch.cancelled || 0);
+  return Math.round((over / batch.total) * 100);
+}

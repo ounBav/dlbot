@@ -102,3 +102,22 @@ test("every stage the API can return has a status label", () => {
     assert.equal(typeof S.status[s], "string", s);
   }
 });
+
+test("toggleAll selects everything up to the cap, then clears", async () => {
+  const { toggleAll } = await import("../src/logic.js");
+  const ids = ["a", "b", "c"];
+  assert.deepEqual([...toggleAll(ids, new Set())], ["a", "b", "c"]);
+  assert.deepEqual([...toggleAll(ids, new Set(["a"]))], ["a", "b", "c"]);   // partial -> all
+  assert.equal(toggleAll(ids, new Set(ids)).size, 0);                        // all -> none
+  assert.deepEqual([...toggleAll(ids, new Set(), 2)], ["a", "b"]);
+  assert.equal(toggleAll(ids, new Set(["a", "b"]), 2).size, 0);
+  assert.equal(toggleAll([], new Set()).size, 0);
+});
+
+test("waveCount and batchPercent", async () => {
+  const { batchPercent, waveCount } = await import("../src/logic.js");
+  assert.deepEqual([0, 1, 10, 11, 25].map((n) => waveCount(n, 10)), [0, 1, 1, 2, 3]);
+  assert.equal(waveCount(5, 0), 5);
+  assert.equal(batchPercent({ total: 20, done: 8, failed: 1, cancelled: 1 }), 50);
+  assert.equal(batchPercent(null), 0);
+});

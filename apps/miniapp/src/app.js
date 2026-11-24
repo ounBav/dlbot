@@ -1,14 +1,16 @@
 // Mini App controller: home -> preview -> progress -> ready | error.
+// TikTok profile tab: home -> profile (search, pick, Select all) -> batch (groups of PROFILE_BATCH_SIZE).
 // Talks to apps/bot/app/api.py. "This device" delivery keeps the file behind a short-lived link
 // (GET /api/files/<token>) that Telegram's downloadFile saves; "Bot chat" delivery sends it to the chat.
 // The ?v= query on imports busts Telegram's webview cache; bump it with index.html.
 
-import { createApi } from "./api.js?v=2";
+import { createApi } from "./api.js?v=3";
 import {
   absoluteUrl, defaultQuality, detectPlatform, extractUrl, formatBytes, formatDuration, formatWait,
   isFinal, jobErrorCode, lowerQuality, percent, relativeTime, retryDelay, screenFor, shortUrl, toProblem,
-} from "./logic.js?v=2";
-import { errorText, S } from "./strings.js?v=2";
+  batchPercent, cleanUsername, toggleAll, waveCount,
+} from "./logic.js?v=3";
+import { errorText, S } from "./strings.js?v=3";
 
 const tg = window.Telegram?.WebApp;
 const config = window.MINIAPP_CONFIG || {};
@@ -30,13 +32,22 @@ const el = {
   readyTitle: $("ready-title"), readyBody: $("ready-body"), readyNote: $("ready-note"), another: $("another"),
   errorBody: $("error-body"), errorActions: $("error-actions"),
   dock: $("dock"), mainBtn: $("main-btn"), toast: $("toast"),
+  profileEntry: $("profile-entry"), profileEntryMark: $("profile-entry-mark"),
+  profileForm: $("profile-form"), username: $("username"), limitChips: $("limit-chips"),
+  profileHint: $("profile-hint"), profileResults: $("profile-results"), resultsTitle: $("results-title"),
+  selectAll: $("select-all"), pickHint: $("pick-hint"), videoList: $("video-list"),
+  batchTitle: $("batch-title"), batchStage: $("batch-stage"), batchBar: $("batch-bar"),
+  batchBarFill: $("batch-bar-fill"), batchCounts: $("batch-counts"), batchNote: $("batch-note"),
+  batchList: $("batch-list"), batchCancel: $("batch-cancel"),
 };
 const screens = {
   home: $("screen-home"), preview: $("screen-preview"), progress: $("screen-progress"),
   ready: $("screen-ready"), error: $("screen-error"),
+  profile: $("screen-profile"), batch: $("screen-batch"),
 };
 
 const POLL_MS = 1500;
+const BATCH_POLL_MS = 2500;
 const SESSION_KEY = "dl.active";
 
 const state = {
@@ -56,6 +67,16 @@ const state = {
   busy: false,
   cooldownUntil: 0,
   cooldownTimer: 0,
+  // TikTok profile tab
+  limit: 10,             // 10 | 50 | 100 | "all"
+  scan: null,            // POST /api/tiktok/scan result (one-time listing)
+  scannedFor: "",        // "username|limit" the listing belongs to
+  picked: new Set(),     // selected video ids
+  scanSeq: 0,
+  batchId: null,
+  batch: null,           // GET /api/tiktok/batches/{id}
+  batchTimer: 0,
+  batchFailures: 0,
 };
 
 let api;
@@ -307,6 +328,9 @@ function renderHome() {
 
 function goHome({ clear = false } = {}) {
   stopPolling();
+  stopBatchPolling();
+  state.batchId = null;
+  state.batch = null;
   session.save(null);
   state.jobId = null;
   state.job = null;
@@ -751,7 +775,7 @@ function errorActions(code) {
   return [back];
 }
 
-function showError(problem, actions) {
+function showError(problem, actions, back = null) {
   const code = problem.code || "E-FAILED";
   const sized = code === "E-TOOBIG" && state.fmt === "video" && state.quality ? "E-TOOBIG-Q" : code;
   el.errorBody.textContent = errorText(sized, { maxMb: maxMb(), retryAfter: problem.retryAfter, formatWait });
@@ -761,8 +785,359 @@ function showError(problem, actions) {
     h("button", { type: "button", class: "btn secondary block", onclick: a.run }, a.label)));
   show("error");
   setMain(primary ? { text: primary.label, onClick: primary.run } : null);
-  setBack(state.preview ? backToPreview : () => goHome());
+  setBack(back || (state.preview ? backToPreview : () => goHome()));
   haptic("error");
+}
+
+// ---------------------------------------------------------------- 6. TikTok profile
+
+function maxSend() {
+  return state.scan?.max_send ?? state.me?.profile_max_send ?? 10;
+}
+
+function batchSize() {
+  return state.scan?.batch_size ?? state.me?.profile_batch_size ?? 10;
+}
+
+function quotaLeft() {
+  const me = state.me;
+  return me ? Math.max(0, me.limit_per_day - me.usage_today) : Infinity;
+}
+
+function scanKey() {
+  return `${cleanUsername(el.username.value).toLowerCase()}|${state.limit}`;
+}
+
+/** The listing on screen still matches the search fields (else the main button searches again). */
+function listingCurrent() {
+  return Boolean(state.scan) && state.scannedFor === scanKey();
+}
+
+function discardScan() {
+  if (!state.scan) return;
+  state.scan = null;
+  state.picked = new Set();
+  api.discard().catch(() => { /* best effort: the server also forgets it after its TTL */ });
+}
+
+function goProfile() {
+  stopPolling();
+  show("profile");
+  setBack(leaveProfile);
+  renderProfile();
+  if (!state.scan) el.username.focus();
+}
+
+function leaveProfile() {
+  state.scanSeq += 1;     // ignore a scan still in flight
+  discardScan();
+  el.profileHint.textContent = "";
+  goHome();
+}
+
+function videoRow(v) {
+  const thumb = h("span", { class: "vthumb" });
+  if (v.thumbnail) {
+    const img = h("img", { alt: "", referrerpolicy: "no-referrer", decoding: "async", loading: "lazy" });
+    img.onerror = () => img.remove();
+    img.src = v.thumbnail;
+    thumb.append(img);
+  }
+  const meta = [v.duration ? formatDuration(v.duration) : null,
+    v.timestamp ? relativeTime(new Date(v.timestamp * 1000).toISOString()) : null].filter(Boolean).join(" · ");
+  return h("li", { class: "history-item" },
+    h("button", {
+      type: "button", class: "video-btn", role: "checkbox", "data-id": v.id,
+      "aria-checked": state.picked.has(v.id) ? "true" : "false",
+    },
+      h("span", { class: "tick", "aria-hidden": "true" }, svg("M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z")),
+      thumb,
+      h("span", { class: "history-text" },
+        h("span", { class: "history-title" }, v.title || shortUrl(v.url)),
+        meta ? h("span", { class: "history-meta" }, meta) : null)));
+}
+
+function renderPicks() {
+  const scan = state.scan;
+  if (!scan) return;
+  const n = state.picked.size;
+  const ids = scan.videos.map((v) => v.id);
+  const target = ids.slice(0, maxSend());
+  const all = target.length > 0 && target.every((id) => state.picked.has(id));
+  el.selectAll.textContent = all ? S.clearAll : S.selectAll;
+  el.selectAll.setAttribute("aria-pressed", all ? "true" : "false");
+  const overQuota = n > quotaLeft();
+  const parts = [S.selected(n, ids.length)];
+  if (n) parts.push(S.groupsHint(batchSize(), waveCount(n, batchSize())));
+  if (ids.length > maxSend()) parts.push(S.maxPick(maxSend()));
+  if (overQuota) parts.push(S.quotaHint(quotaLeft()));
+  el.pickHint.textContent = parts.join(" ");
+  el.pickHint.className = "hint pick-hint" + (overQuota ? " bad" : "");
+  el.videoList.querySelectorAll("[data-id]").forEach((b) => {
+    b.setAttribute("aria-checked", state.picked.has(b.dataset.id) ? "true" : "false");
+  });
+  if (state.screen === "profile" && listingCurrent()) {
+    setMain({ text: S.sendSelected(n), active: n > 0, onClick: () => sendPicked() });
+  }
+}
+
+function renderProfile() {
+  setRadio(el.limitChips, "data-limit", state.limit);
+  const scan = state.scan;
+  el.profileResults.hidden = !scan;
+  if (scan) {
+    el.resultsTitle.textContent = `@${scan.username} · ${S.profileCount(scan.count, scan.truncated)}`;
+    if (el.videoList.dataset.scan !== scan.scan_id) {
+      el.videoList.dataset.scan = scan.scan_id;
+      el.videoList.replaceChildren(...scan.videos.map(videoRow));
+    }
+    renderPicks();
+  } else {
+    el.videoList.dataset.scan = "";
+    el.videoList.replaceChildren();
+  }
+  if (state.screen !== "profile" || listingCurrent()) return;
+  setMain({ text: S.findVideos, active: Boolean(cleanUsername(el.username.value)), onClick: () => runScan() });
+}
+
+async function runScan() {
+  const username = cleanUsername(el.username.value);
+  if (!username || state.busy) return;
+  const seq = ++state.scanSeq;
+  const key = scanKey();
+  el.username.blur();
+  el.profileHint.className = "hint";
+  el.profileHint.textContent = S.scanning;
+  setMain({ text: S.findVideos, progress: true });
+  try {
+    const scan = await api.scan(username, state.limit);
+    if (seq !== state.scanSeq) return;
+    state.scan = scan;
+    state.scannedFor = key;
+    state.picked = new Set();
+    el.profileHint.textContent = "";
+    haptic("success");
+    renderProfile();
+  } catch (err) {
+    if (seq !== state.scanSeq) return;
+    const p = toProblem(err);
+    if (handleFatal(p)) return;
+    state.scan = null;   // the server drops the old listing before it scans
+    el.profileHint.className = "hint bad";
+    el.profileHint.textContent = errorText(p.code, { retryAfter: p.retryAfter, formatWait });
+    haptic("error");
+    renderProfile();
+  }
+}
+
+function togglePick(id) {
+  if (state.picked.has(id)) state.picked.delete(id);
+  else if (state.picked.size >= maxSend()) { toast(S.maxPick(maxSend())); return; }
+  else state.picked.add(id);
+  haptic("select");
+  renderPicks();
+}
+
+function backToProfile() {
+  show("profile", { back: true });
+  setBack(leaveProfile);
+  renderProfile();
+}
+
+async function sendPicked(retried = false) {
+  const scan = state.scan;
+  if (!scan || state.busy || !state.picked.size) return;
+  state.busy = true;
+  setMain({ text: S.sendSelected(state.picked.size), progress: true });
+  const ids = scan.videos.map((v) => v.id).filter((id) => state.picked.has(id));   // listing order
+  try {
+    const batch = await api.send(scan.scan_id, ids);
+    state.scan = null;      // one-time listing: the server forgot it
+    state.picked = new Set();
+    refreshMe();
+    haptic("success");
+    beginBatch(batch);
+  } catch (err) {
+    const p = toProblem(err);
+    if (handleFatal(p)) return;
+    // Chat delivery needs the bot to be allowed to message the user. Ask once, then retry.
+    if (p.code === "E-NOCHAT" && !retried && supports("6.9") && tg.requestWriteAccess) {
+      const granted = await new Promise((resolve) => tg.requestWriteAccess(resolve));
+      if (granted) {
+        state.busy = false;
+        return sendPicked(true);
+      }
+      p.code = "E-NOCHAT-DENIED";
+    }
+    if (p.code === "E-BUSY" && p.id) {   // a batch is already running: show it instead
+      toast(errorText("E-BATCHBUSY"));
+      beginBatch(p.id);
+      return;
+    }
+    const back = { label: S.back, run: backToProfile };
+    if (p.code === "E-SCANGONE") {
+      state.scan = null;
+      showError(p, [{ label: S.findVideos, run: () => { backToProfile(); runScan(); } }, back], backToProfile);
+      return;
+    }
+    if (p.code === "E-QUOTA" && p.remaining > 0) {
+      const first = {
+        label: S.sendFirst(p.remaining),
+        run: () => {
+          state.picked = new Set(ids.slice(0, p.remaining));
+          backToProfile();
+          sendPicked();
+        },
+      };
+      showError(p, [first, back], backToProfile);
+      return;
+    }
+    if (p.code === "E-RATELIMIT") refreshMe();
+    const retry = ["E-FAILED", "E-NETWORK"].includes(p.code)
+      ? { label: S.retry, run: () => { backToProfile(); sendPicked(); } } : null;
+    showError(p, [retry, back], backToProfile);
+  } finally {
+    state.busy = false;
+  }
+}
+
+// ---------------------------------------------------------------- 7. batch progress
+
+function stopBatchPolling() {
+  clearTimeout(state.batchTimer);
+  state.batchTimer = 0;
+}
+
+/** batch: the send response (a batch view) or just its id (resume / already running). */
+function beginBatch(batch) {
+  const id = typeof batch === "string" ? batch : batch.id;
+  stopBatchPolling();
+  state.batchId = id;
+  state.batch = typeof batch === "string" ? null : batch;
+  state.batchFailures = 0;
+  session.save({ batch: id });
+  show("batch");
+  setBack(() => goHome());   // leaving does not stop the batch: the server keeps sending
+  renderBatch();
+  if (state.batch && state.batch.state !== "running") { session.save(null); return; }
+  state.batchTimer = setTimeout(pollBatch, state.batch ? BATCH_POLL_MS : 0);
+}
+
+async function pollBatch() {
+  stopBatchPolling();
+  const id = state.batchId;
+  if (!id || document.hidden) return; // resumed by visibilitychange
+  try {
+    const batch = await api.batch(id);
+    if (id !== state.batchId) return;
+    state.batch = batch;
+    state.batchFailures = 0;
+    renderBatch();
+    if (batch.state === "running") {
+      state.batchTimer = setTimeout(pollBatch, BATCH_POLL_MS);
+    } else {
+      session.save(null);
+      haptic(batch.state === "done" ? "success" : "warning");
+      refreshMe();
+    }
+  } catch (err) {
+    if (id !== state.batchId) return;
+    const p = toProblem(err);
+    if (handleFatal(p)) return;
+    if (p.code === "E-NOTFOUND") {   // forgotten by the server (restart or expiry)
+      session.save(null);
+      state.batchId = null;
+      showError(p, [{ label: S.another, run: () => goHome({ clear: true }) }]);
+      return;
+    }
+    state.batchFailures += 1;
+    if (state.batchFailures === 2) toast(errorText("E-NETWORK"));
+    state.batchTimer = setTimeout(pollBatch, retryDelay(state.batchFailures));
+  }
+}
+
+function batchRow(item) {
+  const label = item.status === "waiting" ? S.itemStatus.waiting : (S.status[item.status] ?? S.status.queued);
+  return h("li", { class: "history-item batch-row" },
+    platformMark("tiktok"),
+    h("span", { class: "history-text" },
+      h("span", { class: "history-title" }, item.title || item.video_id),
+      item.error_code ? h("span", { class: "history-meta" }, errorText(item.error_code, { maxMb: maxMb() })) : null),
+    h("span", { class: `badge ${item.status}`, title: label }, item.status === "done" ? "✓" : label));
+}
+
+function renderBatch() {
+  const b = state.batch;
+  if (!b) {
+    el.batchTitle.textContent = "";
+    el.batchStage.textContent = S.loading;
+    el.batchBar.classList.add("indeterminate");
+    el.batchCounts.textContent = "";
+    el.batchNote.textContent = "";
+    el.batchList.replaceChildren();
+    el.batchCancel.hidden = true;
+    setMain(null);
+    return;
+  }
+  const running = b.state === "running";
+  el.batchTitle.textContent = S.batchTitle(b.username);
+  el.batchStage.textContent = running ? S.batchWave(Math.max(1, b.wave), b.waves, b.batch_size)
+    : b.state === "done" ? S.batchDone : S.batchCancelled;
+  const pct = batchPercent(b);
+  el.batchBar.classList.remove("indeterminate");
+  el.batchBarFill.style.width = `${pct}%`;
+  el.batchBar.setAttribute("aria-valuenow", String(pct));
+  el.batchCounts.textContent = running ? S.batchCounts(b.done, b.failed, b.waiting) : S.batchDoneBody(b.done, b.total);
+  el.batchNote.textContent = running ? S.batchKeepOpen : "";
+
+  const rows = [];
+  let wave = 0;
+  for (const item of b.items) {
+    if (b.waves > 1 && item.wave !== wave) {
+      wave = item.wave;
+      rows.push(h("li", { class: "wave-head", "aria-hidden": "true" }, S.batchWave(wave, b.waves, b.batch_size)));
+    }
+    rows.push(batchRow(item));
+  }
+  el.batchList.replaceChildren(...rows);
+
+  el.batchCancel.hidden = !running;
+  if (state.screen !== "batch") return;
+  if (running) setMain(null);
+  else setMain({ text: S.openChat, onClick: () => tg.close() });
+}
+
+async function cancelBatch() {
+  const id = state.batchId;
+  if (!id || !(await confirm(S.cancelBatchConfirm))) return;
+  el.batchCancel.disabled = true;
+  try {
+    state.batch = await api.cancelBatch(id);
+    haptic("warning");
+    renderBatch();
+    refreshMe();   // never-started videos were given back to today's quota
+  } catch (err) {
+    const p = toProblem(err);
+    if (handleFatal(p)) return;
+    toast(errorText(p.code));
+  } finally {
+    el.batchCancel.disabled = false;
+  }
+  pollBatch();
+}
+
+async function resumeBatch(id) {
+  try {
+    const batch = await api.batch(id);
+    if (batch.state === "running") {
+      beginBatch(batch);
+      return true;
+    }
+  } catch (err) {
+    if (handleFatal(toProblem(err))) return true;
+  }
+  session.save(null);
+  return false;
 }
 
 // ---------------------------------------------------------------- boot
@@ -820,7 +1195,7 @@ function bindEvents() {
     renderPreview();
   });
   // Arrow keys move between options of a radio group (WAI-ARIA radio pattern).
-  for (const group of [el.fmtGroup, el.qualityChips, el.deliveryGroup]) {
+  for (const group of [el.fmtGroup, el.qualityChips, el.deliveryGroup, el.limitChips]) {
     group.addEventListener("keydown", (e) => {
       if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
       const items = [...group.querySelectorAll('[role="radio"]:not(:disabled)')];
@@ -834,15 +1209,47 @@ function bindEvents() {
   }
 
   el.cancel.addEventListener("click", cancelJob);
+
+  el.profileEntryMark.replaceChildren(svg(PLATFORM_ICON.tiktok));
+  el.profileEntry.addEventListener("click", () => { haptic("select"); goProfile(); });
+  el.profileForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (cleanUsername(el.username.value)) runScan();
+  });
+  el.username.addEventListener("input", renderProfile);
+  el.limitChips.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-limit]");
+    if (!b) return;
+    state.limit = b.dataset.limit === "all" ? "all" : Number(b.dataset.limit);
+    haptic("select");
+    renderProfile();
+  });
+  el.videoList.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-id]");
+    if (b) togglePick(b.dataset.id);
+  });
+  el.selectAll.addEventListener("click", () => {
+    if (!state.scan) return;
+    state.picked = toggleAll(state.scan.videos.map((v) => v.id), state.picked, maxSend());
+    haptic("select");
+    renderPicks();
+  });
+  el.batchCancel.addEventListener("click", cancelBatch);
+  // Closing the app forgets the one-time listing right away (the server would after its TTL).
+  window.addEventListener("pagehide", () => { if (state.scan) discardScan(); });
   el.another.addEventListener("click", () => goHome({ clear: true }));
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && state.jobId) pollTick();
+    if (!document.hidden && state.batchId && state.batch?.state !== "done"
+        && state.batch?.state !== "cancelled") pollBatch();
   });
   tg?.onEvent?.("themeChanged", () => {
     applyTheme();
     // MainButton colors come from the theme: re-apply the current screen's button.
     if (state.screen === "home") renderHome();
     else if (state.screen === "preview" && state.preview) renderPreview();
+    else if (state.screen === "profile") { el.videoList.dataset.scan = ""; renderProfile(); }
+    else if (state.screen === "batch") renderBatch();
   });
 }
 
@@ -920,6 +1327,7 @@ async function boot() {
 
   const saved = session.load();
   if (saved?.id && (await resume(saved))) return;
+  if (saved?.batch && (await resumeBatch(saved.batch))) return;
 
   show("home");
   renderHome();
